@@ -250,3 +250,92 @@ Rectangular mode does not generate the square runners' dense speedup or block
 summaries. Compare its rows with a deliberately chosen dense baseline, matching
 matrix shape, timing mode, repetitions, and accounting for PE counts. Existing
 dense/fused commands and their summaries remain available.
+
+## Rectangular dense and the 45-case profiled grid suite
+
+Both `bench.py` / `run.sh` and `sweep.py` / `run_sweep.sh` accept
+`dense-rectangular` as well as `fused-rectangular`. Dense uses the separate
+`MeshGEMVRectangular/` kernel; it takes `--PX`, `--PY`, `--group-num-x` and
+`--group-num-y` but no rank options. Dense partitions M over Y and N over X;
+fused partitions M and N over Y and rank over X. Dense uses only the Y group
+count for its collective. Each rectangular execution mode needs its own run name.
+
+```bash
+bash run.sh dense-rectangular dense_rect_profile \
+  --PX 128 --PY 32 --group-num-x 16 --group-num-y 4 \
+  --projections qkvo gate_up down --profile-phases --suppress-simfab-trace
+bash run_sweep.sh dense-rectangular dense_custom_profile \
+  --PX 32 --PY 128 --group-num-x 4 --group-num-y 16 \
+  --M 4096 --N 11008 --profile-phases --suppress-simfab-trace
+```
+
+The complete experiment can be reviewed and launched from `Llama2Projections/`:
+
+```bash
+python3 profile_grid_suite.py --run-name grid45_v1 --dry-run
+# Run in tmux to survive SSH disconnects. --jobs counts only this queue.
+python3 profile_grid_suite.py --run-name grid45_v1 --jobs 2
+# Resume after interruption (completed successful cases are skipped):
+python3 profile_grid_suite.py --run-name grid45_v1 --jobs 2 --resume
+```
+
+Set `CEREBRAS_SDK_DIR` to the directory containing executable `cslc` and
+`cs_python` launchers, or put them on PATH. The default SDK directory is
+`../cs_sdk` relative to the repository. Optional `--build-root /tmp/wafer-builds`
+is passed to each case. `--runner sweep` exercises the custom-shape runner
+instead of the fixed-shape runner, with the same 45 physical cases.
+
+The suite pairs configurations explicitly (it does not form a Cartesian product
+of independent PX/PY/group lists):
+
+| PX | PY | Gx | Gy | PEs per group, either axis |
+|---:|---:|---:|---:|---:|
+| 64 | 64 | 8 | 8 | 8 |
+| 32 | 128 | 4 | 16 | 8 |
+| 128 | 32 | 16 | 4 | 8 |
+
+It runs qkvo (4096 x 4096), gate_up (4096 x 11008), and down (11008 x 4096).
+Each shape/grid has one dense case and four low-rank cases: 9 dense + 36 fused.
+Explicit ranks are identical across grids:
+
+| Target retained-work ratio | qkvo rank | gate_up/down rank |
+|---:|---:|---:|
+| 0.2 | 384 | 640 |
+| 0.4 | 768 | 1152 |
+| 0.6 | 1280 | 1792 |
+| 0.8 | 1664 | 2432 |
+
+All cases use phase profiling, one warmup and one measured iteration, and
+suppressed bulk traces. The target ratios are labels, not instructions to
+round ranks; actual ratios use `R*(M+N)/(M*N)`. The individual rectangular
+commands accept `--rank-target-ratios` paired with `--ranks` to preserve labels.
+Dense uses an empty rank/target and actual retained-work ratio 1.
+
+Every case gets its own run, build and log paths. The suite writes
+`suites/<name>/manifest.json`, queue logs, `summary.csv`, and `phases.csv`;
+merged CSVs refresh after each case completes. Missing and failed cases remain
+visible. Completed case outputs are under `runs/` (or `sweeps/`). No files from
+prior ZIP packages or other suites are merged.
+
+Collective phase timings include the broadcast; there is no separate broadcast
+marker. Profiling adds overhead: do not mix these total cycles with unprofiled
+numbers. The dense and fused kernels retain their original different reduction
+algorithms, and their final output replication axes differ. Model accuracy is
+not measured here: dense is checked against host GEMV, and fused against host
+factorized GEMV with directly generated factors.
+
+### Keeping the original dense baseline
+
+Rectangular dense is an optional control, not a replacement for the original
+64x64 baseline. To vary only the low-rank configuration, use:
+
+```bash
+python3 profile_grid_suite.py --run-name lowrank36_v1 --low-rank-only --jobs 2
+```
+
+This runs the same 36 fused cases without rerunning or changing dense. Compare
+against the existing original dense 64x64 measurements with matching profiling
+mode; if necessary, collect them separately with `run.sh dense --P 64
+--group-num 8 --profile-phases`. Keep distinct labels for speedup relative to
+fixed dense 64x64, same-grid dense, and best measured dense. The 45-case suite
+supports the latter two comparisons as additional controls.

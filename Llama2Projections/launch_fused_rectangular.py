@@ -110,8 +110,10 @@ def main(upload_f16=upload_f16_default):
     upload_f16(runner, sym_A, tensor_A.reshape(Py, Px, Mt * Rt), label="A")
     upload_f16(runner, sym_B, tensor_B.reshape(Py, Px, Rt * Nt), label="B")
 
+    print("Initializing fused kernel", flush=True)
     warmups = 1
     runner.launch("init_task", nonblock=False)
+    print("Executing fused kernel", flush=True)
     if args.profile_phases:
         runner.launch("meshgemv_profile_host", np.int16(warmups), nonblock=False)
     else:
@@ -120,6 +122,7 @@ def main(upload_f16=upload_f16_default):
         )
 
 
+    print("Collecting fused results", flush=True)
     result_u32 = np.zeros(Px * Py * Nt, dtype=np.uint32)
     runner.memcpy_d2h(
         result_u32, sym_res, 0, 0, Px, Py, Nt, streaming=False,

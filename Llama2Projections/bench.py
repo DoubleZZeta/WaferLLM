@@ -159,6 +159,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="target R(M+N)/(MN) values (default: .125,.25,.5,.75)",
     )
     subcommands.add_parser("fused-rectangular", help="run rectangular low-rank GEMV; use fused-rectangular --help")
+    subcommands.add_parser("dense-rectangular", help="run rectangular dense GEMV; use dense-rectangular --help")
     summary = subcommands.add_parser(
         "summary", help="rebuild the summary CSVs from dense.csv and fused.csv"
     )
@@ -503,6 +504,7 @@ def run_logged(commands: list[list[str]], log_path: Path) -> str:
             for line in process.stdout:
                 print(line, end="", flush=True)
                 log.write(line)
+                log.flush()
                 output_lines.append(line)
             return_code = process.wait()
             if return_code:
@@ -527,6 +529,8 @@ def run_case(
     """Run one case and copy launcher metrics into CSV columns."""
     try:
         result = parse_result(run_logged(commands, log_path))
+        if row.get("profile_phases") and not result.get("phases"):
+            raise ValueError("profiled launcher did not report phase timings")
         row.update({column: result[metric] for metric, column in columns.items()})
         if "phases" in result:
             profile_path = log_path.with_suffix(".phases.json")
@@ -683,6 +687,9 @@ def print_summary(run_dir: Path, block_rows: list[dict]) -> None:
 def main(argv: list[str] | None = None) -> int:
     import sys
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "dense-rectangular":
+        import rectangular
+        return rectangular.main(arguments[1:], mode="bench", execution="dense")
     if arguments and arguments[0] == "fused-rectangular":
         import rectangular
         return rectangular.main(arguments[1:], mode="bench")

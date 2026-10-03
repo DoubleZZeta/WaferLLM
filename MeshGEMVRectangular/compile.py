@@ -1,0 +1,86 @@
+"""Compile the rectangular dense MeshGEMV implementation.
+
+  --mode sim     : local `cslc` build into out_<cfg>/
+  --mode device  : cloud SdkCompiler build -> compile_out/artifact_<cfg>.json
+
+M must be divisible by PY, and N by PX. Dense reduces only along Y;
+group_num_x is validated for experiment bookkeeping but does not affect code.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import time
+
+
+def parse_args():
+    ap = argparse.ArgumentParser(description="Compile MeshGEMV (WSE-3, SDK 2.10)")
+    ap.add_argument("--mode", choices=["sim", "device"], required=True)
+    ap.add_argument("--PX", type=int, required=True)
+    ap.add_argument("--PY", type=int, required=True)
+    ap.add_argument("--M", type=int, required=True)
+    ap.add_argument("--N", type=int, required=True)
+    ap.add_argument("--group_num_x", type=int, required=True)
+    ap.add_argument("--group_num_y", type=int, required=True)
+    # cslc mounts only the working directory, so this must lie beneath it.
+    ap.add_argument("--out-dir", help="sim build directory (default: out_<cfg>)")
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+    Px, Py, M, N, Gx, Gy = args.PX, args.PY, args.M, args.N, args.group_num_x, args.group_num_y
+    if min(Px, Py) < 3:
+        raise SystemExit("PX and PY must be at least 3")
+    if min(M, N) <= 0 or M % Py or N % Px:
+        raise SystemExit("require positive M/N, M divisible by PY and N divisible by PX")
+    if Gx <= 0 or Px % Gx or Gy <= 0 or Py % Gy:
+        raise SystemExit("group counts must be positive and divide their own axes")
+    # The original two-tree kernel receives from both reduction levels.
+    # Singleton groups/one group require a different collective implementation.
+    if Gy < 2 or Py // Gy < 2:
+        raise SystemExit("dense two-tree reduction requires at least 2 Y groups and 2 PEs per Y group")
+    Mt, Nt = M // Py, N // Px
+    pe_num_group = Py // Gy
+    root_1st_phase = pe_num_group // 2
+    root_2nd_phase = (Gy // 2) * pe_num_group + root_1st_phase
+    cfg = f"{Px}_{Py}_{Mt}_{Nt}_{Gx}_{Gy}"
+    params = (
+        f"Px:{Px},Py:{Py},Mt:{Mt},Nt:{Nt},pe_num_group:{pe_num_group},"
+        f"root_1st_phase:{root_1st_phase},root_2nd_phase:{root_2nd_phase}"
+    )
+
+    print("Start compiling: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)
+
+    if args.mode == "sim":
+        out_dir = args.out_dir or f"out_{cfg}"
+        if os.path.lexists(out_dir):
+            # Not `rm -rf`: some servers wrap rm in an interactive prompt.
+            shutil.rmtree(out_dir)
+        cmd = [
+            "cslc", "--arch=wse3", os.path.join(os.path.dirname(__file__), "src", "layout.csl"),
+            f"--fabric-dims={Px + 7},{Py + 2}", "--fabric-offsets=4,1",
+            f"--params={params}", "-o", out_dir, "--memcpy", "--channels", "1",
+        ]
+        subprocess.run(cmd, check=True)
+    else:
+        from cerebras.sdk.client import SdkCompiler
+        os.makedirs("compile_out", exist_ok=True)
+        options = (
+            f"--arch=wse3 --fabric-dims=762,1172 --fabric-offsets=4,1 "
+            f"-o out --memcpy --channels=1 --params={params}"
+        )
+        with SdkCompiler(resource_cpu=48000, resource_mem=64 << 30, disable_version_check=True) as compiler:
+            artifact_id = compiler.compile(
+                app_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"),
+                csl_main="layout.csl", options=options, out_path="compile_out",
+            )
+        with open(f"compile_out/artifact_{cfg}.json", "w", encoding="utf-8") as f:
+            json.dump({"artifact_id": artifact_id}, f)
+
+    print("End compiling: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)
+
+
+if __name__ == "__main__":
+    main()

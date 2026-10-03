@@ -126,6 +126,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated target R(M+N)/(MN); R is rounded to a multiple of P",
     )
     subcommands.add_parser("fused-rectangular", help="run rectangular low-rank GEMV; use fused-rectangular --help")
+    subcommands.add_parser("dense-rectangular", help="run rectangular dense GEMV; use dense-rectangular --help")
     summary = subcommands.add_parser("summary",
                                      help="rebuild summary.csv from dense.csv and fused.csv")
     summary.add_argument("--run-name", required=True)
@@ -339,6 +340,9 @@ def run_command(args: argparse.Namespace, run_dir, config: dict) -> int:
 def main(argv: list[str] | None = None) -> int:
     import sys
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "dense-rectangular":
+        import rectangular
+        return rectangular.main(arguments[1:], mode="sweep", execution="dense")
     if arguments and arguments[0] == "fused-rectangular":
         import rectangular
         return rectangular.main(arguments[1:], mode="sweep")

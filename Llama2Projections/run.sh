@@ -5,7 +5,7 @@ set -euo pipefail
 # session. Extra arguments are passed directly to bench.py.
 #
 # Usage:
-#   bash run.sh {dense|fused|fused-rectangular} [run_name] [bench.py options]
+#   bash run.sh {dense|fused|dense-rectangular|fused-rectangular} [run_name] [bench.py options]
 #
 # Examples:
 #   bash run.sh dense p64 --P 64 --group-num 8
@@ -21,8 +21,8 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(dirname "$SCRIPT_DIR")
 
-if [ "$#" -lt 1 ] || { [ "$1" != dense ] && [ "$1" != fused ] && [ "$1" != fused-rectangular ]; }; then
-    echo "Usage: bash run.sh {dense|fused|fused-rectangular} [run_name] [bench.py options]" >&2
+if [ "$#" -lt 1 ] || { [ "$1" != dense ] && [ "$1" != fused ] && [ "$1" != fused-rectangular ] && [ "$1" != dense-rectangular ]; }; then
+    echo "Usage: bash run.sh {dense|fused|dense-rectangular|fused-rectangular} [run_name] [bench.py options]" >&2
     exit 2
 fi
 SUBCOMMAND=$1
@@ -72,6 +72,6 @@ echo "Started Llama-2 projection benchmark ($SUBCOMMAND)."
 echo "  run:     $RUN_NAME"
 echo "  session: $SESSION_NAME"
 echo "  results: $RUN_DIR/$SUBCOMMAND.csv"
-if [ "$SUBCOMMAND" != fused-rectangular ]; then echo "  summary: $RUN_DIR/block_summary.csv"; fi
+if [[ "$SUBCOMMAND" != *-rectangular ]]; then echo "  summary: $RUN_DIR/block_summary.csv"; fi
 echo "  attach:  tmux attach -t $SESSION_NAME"
 echo "  log:     tail -f $RUN_LOG"
