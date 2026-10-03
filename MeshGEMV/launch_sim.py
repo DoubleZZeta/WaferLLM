@@ -5,10 +5,11 @@ import random
 
 import numpy as np
 
-from cerebras.sdk.sdk_utils import input_array_to_u32, memcpy_view
+from cerebras.sdk.sdk_utils import memcpy_view
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime, MemcpyDataType, MemcpyOrder
 
 import host_common as hc
+from sim_transfers import upload_f16
 
 
 def parse_args():
@@ -17,6 +18,11 @@ def parse_args():
     parser.add_argument("--M", required=True, type=int, help="Left vector dimension: 1 x M")
     parser.add_argument("--N", required=True, type=int, help="Right matrix dimension: M x N")
     parser.add_argument("--group_num", required=True, type=int, help="Reduce group count")
+    parser.add_argument(
+        "--profile-phases",
+        action="store_true",
+        help="run one warmed, timestamp-instrumented iteration and report phase costs",
+    )
     return parser.parse_args()
 
 
@@ -51,18 +57,24 @@ def main():
     sym_res = runner.get_id("res")
     symbol_time_memcpy = runner.get_id("time_memcpy")
     symbol_time_ref = runner.get_id("time_ref")
+    symbol_profile = runner.get_id("profile_time") if args.profile_phases else None
 
-    X_u32 = input_array_to_u32(tensor_X.ravel(), 1, 1)
-    runner.memcpy_h2d(sym_X, X_u32, 0, 0, P, P, Mt,
-                      streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
-
-    W_u32 = input_array_to_u32(hc.tile_W(tensor_W, P, Mt, Nt), 1, 1)
-    runner.memcpy_h2d(sym_W, W_u32, 0, 0, P, P, Mt * Nt,
-                      streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
+    upload_f16(runner, sym_X, tensor_X.reshape(P, P, Mt), label="X")
+    upload_f16(runner, sym_W,
+               hc.tile_W(tensor_W, P, Mt, Nt).reshape(P, P, Mt * Nt), label="W")
 
     runner.launch("init_task", nonblock=False)
-    total_warmup_times, total_repeat_times = 1, 10
-    runner.launch("meshgemv_host", np.int16(total_warmup_times), np.int16(total_repeat_times), nonblock=False)
+    total_warmup_times = 1
+    total_repeat_times = 1 if args.profile_phases else 10
+    if args.profile_phases:
+        runner.launch("meshgemv_profile_host", np.int16(total_warmup_times), nonblock=False)
+    else:
+        runner.launch(
+            "meshgemv_host",
+            np.int16(total_warmup_times),
+            np.int16(total_repeat_times),
+            nonblock=False,
+        )
 
     res_1d_u32 = np.zeros(P * N, dtype=np.uint32)
     runner.memcpy_d2h(res_1d_u32, sym_res, 0, 0, P, P, Nt,
@@ -80,6 +92,16 @@ def main():
                       order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT, nonblock=False)
     time_ref_hwl = np.reshape(time_ref_1d_f32, (P, P, 2), order="C")
 
+    profile_hwl = None
+    if args.profile_phases:
+        profile_words = np.zeros(P * P * 10, dtype=np.float32)
+        runner.memcpy_d2h(
+            profile_words, symbol_profile, 0, 0, P, P, 10,
+            streaming=False, order=MemcpyOrder.ROW_MAJOR,
+            data_type=MemcpyDataType.MEMCPY_32BIT, nonblock=False,
+        )
+        profile_hwl = profile_words.reshape(P, P, 10)
+
     runner.stop()
 
     expected = np.matmul(X.astype(np.float32), tensor_W.astype(np.float32))  # (1, N)
@@ -92,6 +114,36 @@ def main():
     print(f"Mean cycle count: {mean_cycle}")
     print(f"Max Cycle count: {max_cycle}")
     print(f"max rel err: {rel_err.max():.4f}")
+
+    if args.profile_phases:
+        phase_metrics = hc.decode_phase_timing(profile_hwl, time_ref_hwl, P)
+        iteration_mean = phase_metrics["profile_iteration"]["mean_cycles"]
+        print("Phase profile (one warmed iteration; includes timestamp overhead):")
+        for name in (
+            "dense_local_compute",
+            "dense_y_allreduce",
+            "control_and_markers",
+        ):
+            metric = phase_metrics[name]
+            percentage = 100.0 * metric["mean_cycles"] / max(iteration_mean, 1.0)
+            print(
+                f"  {name}: mean={metric['mean_cycles']:.1f}, "
+                f"max_pe={metric['max_pe_cycles']:.1f}, share={percentage:.1f}%"
+            )
+        profile_total = phase_metrics["profile_iteration"]
+        print(
+            f"  profile_iteration: mean={profile_total['mean_cycles']:.1f}, "
+            f"max_pe={profile_total['max_pe_cycles']:.1f}"
+        )
+        outer_control = mean_cycle - profile_total["mean_cycles"]
+        print(
+            f"  outer_timing_and_exit: mean={outer_control:.1f} "
+            "(total timer minus profiled loop)"
+        )
+        print(
+            "  Note: control_and_markers includes loop dispatch plus profiling "
+            "marker cost; use the normal run for unperturbed total cycles."
+        )
 
     assert rel_err.max() < 0.1, f"result mismatch: max rel err {rel_err.max()}"
     print("SUCCESS!")

@@ -9,6 +9,7 @@ are derived here from P / M / N / group_num so callers only pass the high-level 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import time
 
@@ -20,6 +21,8 @@ def parse_args():
     ap.add_argument("--M", type=int, required=True)
     ap.add_argument("--N", type=int, required=True)
     ap.add_argument("--group_num", type=int, required=True)
+    # cslc mounts only the working directory, so this must lie beneath it.
+    ap.add_argument("--out-dir", help="sim build directory (default: out_<cfg>)")
     return ap.parse_args()
 
 
@@ -40,10 +43,12 @@ def main():
     print("Start compiling: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)
 
     if args.mode == "sim":
-        out_dir = f"out_{cfg}"
-        subprocess.run(["rm", "-rf", out_dir], check=True)
+        out_dir = args.out_dir or f"out_{cfg}"
+        if os.path.lexists(out_dir):
+            # Not `rm -rf`: some servers wrap rm in an interactive prompt.
+            shutil.rmtree(out_dir)
         cmd = [
-            "cslc", "--arch=wse3", "./src/layout.csl",
+            "cslc", "--arch=wse3", os.path.join(os.path.dirname(__file__), "src", "layout.csl"),
             f"--fabric-dims={P + 7},{P + 2}", "--fabric-offsets=4,1",
             f"--params={params}", "-o", out_dir, "--memcpy", "--channels", "1",
         ]

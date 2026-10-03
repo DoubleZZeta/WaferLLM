@@ -25,3 +25,21 @@ __pycache__/
 
 AGENTS.md
 CLAUDE.md
+
+# Local machine files and credentials
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Local delivery packages and experiment/report exports
+/WaferLLM-*.zip
+/WaferLLM-*.zip.sha256
+/WaferLLM-*.tar.gz
+/WaferLLM-*.tar.gz.sha256
+/rectangular_ffn_grid_compare_logs_*.tar.gz
+/waferllm_all_latest_logs_*.zip
+/latest_two_runs_csvs_*/
+/latest_two_runs_csvs_*.zip
+/context/
+/MeshGEMVLowerRankUnfused/benchmark_results*.csv

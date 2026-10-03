@@ -1,0 +1,332 @@
+// Per-PE program for the dense row-vector GEMV
+//
+//     Y[1, N] = X[1, M] @ W[M, N]
+//
+// The P x P PE grid partitions M along the PE y coordinate and N along
+// the PE x coordinate.  PE (py, px) owns X_py and W_py,px, computes the
+// Nt-element partial result X_py @ W_py,px, and then participates in a
+// reduction along y to form output block Y_px.
+
+// Parameters supplied by layout.csl.  memcpy_params configures host/device
+// transfers, while comm_params contains the colors used by the reduction.
+param memcpy_params;
+param comm_params;
+
+// Global grid and local tile sizes:
+//   Mt = M / P: input elements held by each PE
+//   Nt = N / P: output elements computed by each PE column
+param P: i16;
+param Mt: i16;
+param Nt: i16;
+
+// Parameters for the two-level reduction along the PE y axis.
+// pe_num_group is the number of PE rows in one group.
+param pe_num_group: i16;
+param root_1st_phase: i16;
+param root_2nd_phase: i16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_module = @import_module("<layout>");
+
+const comm_mod = @import_module("comm_lib/comm_pe.csl", .{
+    .comm_params = comm_params,
+    .P = P, .Mt = Mt, .Nt = Nt,
+    .pe_num_group = pe_num_group,
+    .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
+});
+
+// This PE's logical coordinates.  They are initialized by init_task().
+var px: i16 = 0;
+var py: i16 = 0;
+
+// Local input block X_py.  The same X block is replicated across every PE
+// column with the same py coordinate.
+var X_tile: [Mt]f16 = @zeros([Mt]f16);
+var ptr_X: [*]f16 = &X_tile;
+var X_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> X_tile[i] });
+
+// Local matrix block W_py,px, stored as Mt consecutive rows of Nt values.
+// W_dsd therefore describes a sequence of Mt vectors, each of width Nt.
+var W_tile: [Mt*Nt]f16 = @zeros([Mt*Nt]f16);
+var ptr_W: [*]f16 = &W_tile;
+var W_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> W_tile[i] });
+
+// Nt-element partial output.  It first holds X_py @ W_py,px and, after the
+// all-reduce, holds the complete output block Y_px on every PE in column px.
+var res_tile: [Nt]f16 = @zeros([Nt]f16);
+var ptr_res: [*]f16 = &res_tile;
+var res_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> res_tile[i] });
+
+// Data-structure registers used by the vector FMA below.  Both destination
+// and source 0 refer to res_tile so each step accumulates into the old result;
+// source 1 advances through the Nt-wide rows of W_tile.
+const res_dest_dsr = @get_dsr(dsr_dest, 1);
+const res_src0_dsr = @get_dsr(dsr_src0, 1);
+const W_src1_dsr = @get_dsr(dsr_src1, 1);
+
+const timestamp = @import_module("<time>");
+// Timestamps around the measured kernel repetitions.  Host-to-device and
+// device-to-host memcpy operations are outside this interval.
+var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+
+var time_buf_f32 = @zeros([3]f32);
+var ptr_time_memcpy: [*]f32 = &time_buf_f32;
+
+var tscRefBuffer = @zeros([timestamp.tsc_size_words]u16);
+var time_ref_f32 = @zeros([2]f32);
+var ptr_time_ref: [*]f32 = &time_ref_f32;
+
+// Optional one-iteration diagnostic profile. Five boundaries split a dense
+// iteration into control-before, local GEMV, Y all-reduce, and control-after.
+// These timestamp calls perturb the iteration, so profile mode uses a wholly
+// separate callback chain from the normal benchmark path.
+var profile_waiting_for_loop_end: bool = false;
+var tscProfileLoopStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscProfileComputeStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscProfileComputeEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscProfileYReduceEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscProfileLoopEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+
+// Each 48-bit timestamp uses two f32 containers for host memcpy.
+var profile_time_f32 = @zeros([10]f32);
+var ptr_profile_time: [*]f32 = &profile_time_f32;
+
+fn init_task() void {
+    // Called once by the host after X and W have been copied to the device.
+    timestamp.enable_tsc();
+    @assert(P >= 3);
+    px = @as(i16, layout_module.get_x_coord());
+    py = @as(i16, layout_module.get_y_coord());
+
+    // Classify this PE's role in the grouped reduction (group boundary,
+    // group root, global root, and so on).
+    comm_mod.init_(px, py);
+
+    // Tell the runtime that initialization is complete.
+    sys_mod.unblock_cmd_stream();
+}
+
+// @map invokes this callback once for every scalar in X_tile.  W_src1_dsr
+// advances to the corresponding Nt-wide row of W_tile on each invocation:
+//
+//   res_tile[:] = res_tile[:] + curX * current_W_row[:]
+fn gemv_static_step(curL: f16) void {
+    @fmach(res_dest_dsr, res_src0_dsr, W_src1_dsr, curL);
+}
+
+// Compute one complete GEMV iteration on this PE.
+fn mv_compute() void {
+    // Bind the DSRs above to their memory descriptors.  save_address=true
+    // lets W_src1_dsr keep advancing through W's Mt rows during @map.
+    @load_to_dsr(res_dest_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(res_src0_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(W_src1_dsr, W_dsd, .{ .save_address = true });
+
+    // Local calculation: after Mt vector FMAs,
+    //     res_tile = X_py @ W_py,px.
+    @map(gemv_static_step, X_dsd);
+
+    // For this fixed px, sum res_tile over all py values.  The routine then
+    // broadcasts the complete Y_px back to every PE row in this column.
+    comm_mod.two_tree_allreduce_y(ptr_res);
+
+    // Start the next warmup/measured iteration, or exit if all are finished.
+    meshgemv_entry();
+}
+
+// Profile-mode warmups use a separate callback path. This keeps every
+// profiling branch and timestamp call out of the normal benchmark kernel.
+fn mv_compute_profile_warmup() void {
+    @load_to_dsr(res_dest_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(res_src0_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(W_src1_dsr, W_dsd, .{ .save_address = true });
+    @map(gemv_static_step, X_dsd);
+    comm_mod.two_tree_allreduce_y(ptr_res);
+    meshgemv_profile_entry();
+}
+
+// The single measured profile iteration has unconditional markers. Keeping
+// it separate prevents even a disabled `if (profile)` from costing cycles in
+// mv_compute(), which is the path used for headline benchmark numbers.
+fn mv_compute_profile_measured() void {
+    @load_to_dsr(res_dest_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(res_src0_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(W_src1_dsr, W_dsd, .{ .save_address = true });
+    @map(gemv_static_step, X_dsd);
+    timestamp.get_timestamp(&tscProfileComputeEndBuffer);
+
+    comm_mod.two_tree_allreduce_y(ptr_res);
+    timestamp.get_timestamp(&tscProfileYReduceEndBuffer);
+    profile_waiting_for_loop_end = true;
+    meshgemv_profile_entry();
+}
+
+// Values are supplied by meshgemv_host().  Defaults are useful only before
+// the host launches the exported entry point.
+var total_repeat_times: i16 = 1;
+var total_warmup_times: i16 = 0;
+var repeat_times: i16 = 0;
+
+// Host entry point.  launch_sim.py currently requests one warmup followed by
+// ten measured repetitions.
+fn meshgemv_host(total_warmup_times_: i16, total_repeat_times_: i16) void {
+    total_repeat_times = total_repeat_times_;
+    total_warmup_times = total_warmup_times_;
+
+    repeat_times = 0;
+
+    meshgemv_entry();
+}
+
+// Diagnostic entry: warm up, then capture exactly one measured iteration.
+// Continue to use meshgemv_host() for unperturbed headline cycle counts.
+fn meshgemv_profile_host(total_warmup_times_: i16) void {
+    profile_waiting_for_loop_end = false;
+    total_repeat_times = 1;
+    total_warmup_times = total_warmup_times_;
+    repeat_times = 0;
+    meshgemv_profile_entry();
+}
+
+fn meshgemv_entry() void {
+    // Run warmup + measured iterations.  Timing starts immediately after all
+    // warmups, so only total_repeat_times iterations contribute to the result.
+    if (repeat_times == total_repeat_times + total_warmup_times) {
+        exit();
+    } else {
+        if (repeat_times == total_warmup_times) {
+            // The reference timestamp lets the host align timestamps from
+            // different PEs before comparing their start and end cycles.
+            timestamp.get_timestamp(&tscRefBuffer);
+            timestamp.get_timestamp(&tscStartBuffer);
+        }
+
+        repeat_times += 1;
+
+        // The FMA callback accumulates in place, so the output must be reset
+        // before every warmup or measured iteration.
+        @fmovh(res_dsd, 0.0);
+        mv_compute();
+    }
+}
+
+fn meshgemv_profile_entry() void {
+    // This branch exists only in diagnostic mode; the normal benchmark entry
+    // above contains no profiling state or marker checks.
+    if (profile_waiting_for_loop_end) {
+        timestamp.get_timestamp(&tscProfileLoopEndBuffer);
+        profile_waiting_for_loop_end = false;
+    }
+
+    if (repeat_times == total_repeat_times + total_warmup_times) {
+        exit_profile();
+    } else if (repeat_times == total_warmup_times) {
+        timestamp.get_timestamp(&tscRefBuffer);
+        timestamp.get_timestamp(&tscStartBuffer);
+        timestamp.get_timestamp(&tscProfileLoopStartBuffer);
+        repeat_times += 1;
+
+        // Count destination clearing as part of local compute, matching the
+        // boundaries used by the fused profiler.
+        timestamp.get_timestamp(&tscProfileComputeStartBuffer);
+        @fmovh(res_dsd, 0.0);
+        mv_compute_profile_measured();
+    } else {
+        repeat_times += 1;
+        @fmovh(res_dsd, 0.0);
+        mv_compute_profile_warmup();
+    }
+}
+
+fn exit() void {
+    // All measured repetitions have completed on this PE.
+    timestamp.get_timestamp(&tscEndBuffer);
+    timestamp.disable_tsc();
+
+    // Pack the 48-bit hardware timestamps into f32 words so the host can read
+    // them through the memcpy API and reconstruct the integer cycle counts.
+    f_reference_timestamps();
+    f_memcpy_timestamps();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn exit_profile() void {
+    timestamp.get_timestamp(&tscEndBuffer);
+    timestamp.disable_tsc();
+    f_reference_timestamps();
+    f_memcpy_timestamps();
+    f_profile_timestamps();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn pack_profile_timestamp(tsc_buffer: [*]u16, output_offset: i16) void {
+    var lo_: u16 = tsc_buffer[0];
+    var hi_: u16 = tsc_buffer[1];
+    profile_time_f32[output_offset] = @bitcast(
+        f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_)
+    );
+
+    lo_ = tsc_buffer[2];
+    hi_ = 0;
+    profile_time_f32[output_offset + 1] = @bitcast(
+        f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_)
+    );
+}
+
+fn f_profile_timestamps() void {
+    pack_profile_timestamp(&tscProfileLoopStartBuffer, 0);
+    pack_profile_timestamp(&tscProfileComputeStartBuffer, 2);
+    pack_profile_timestamp(&tscProfileComputeEndBuffer, 4);
+    pack_profile_timestamp(&tscProfileYReduceEndBuffer, 6);
+    pack_profile_timestamp(&tscProfileLoopEndBuffer, 8);
+}
+
+fn f_memcpy_timestamps() void {
+    var lo_ : u16 = 0;
+    var hi_ : u16 = 0;
+
+    lo_ = tscStartBuffer[0];
+    hi_ = tscStartBuffer[1];
+    time_buf_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscStartBuffer[2];
+    hi_ = tscEndBuffer[0];
+    time_buf_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscEndBuffer[1];
+    hi_ = tscEndBuffer[2];
+    time_buf_f32[2] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+}
+
+fn f_reference_timestamps() void {
+    var lo_ : u16 = 0;
+    var hi_ : u16 = 0;
+
+    lo_ = tscRefBuffer[0];
+    hi_ = tscRefBuffer[1];
+    time_ref_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscRefBuffer[2];
+    hi_ = 0;
+    time_ref_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+}
+
+comptime {
+    // Timing symbols read by launch_sim.py after kernel completion.
+    @export_symbol(ptr_time_memcpy, "time_memcpy");
+    @export_symbol(ptr_time_ref, "time_ref");
+    @export_symbol(ptr_profile_time, "profile_time");
+}
+
+comptime {
+    // Data symbols used for H2D/D2H transfers and callable device entry points.
+    @export_symbol(ptr_X, "X");
+    @export_symbol(ptr_W, "W");
+    @export_symbol(ptr_res, "res");
+
+    @export_symbol(init_task);
+    @export_symbol(meshgemv_entry);
+    @export_symbol(meshgemv_host);
+    @export_symbol(meshgemv_profile_host);
+}

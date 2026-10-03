@@ -1,0 +1,4 @@
+All 36 header words match weight data from PE row 49.
+Stream displacement: 104857600 bytes (100 MiB).
+Malformed num_receivers: 57135
+Malformed memcpy_optype: 13681

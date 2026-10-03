@@ -78,3 +78,69 @@ def decode_timing(time_memcpy_hwl, time_ref_hwl, P, total_repeat_times):
     mean_cycle = np.mean(time_end - time_start) / total_repeat_times
     max_cycle = (max_time_end - min_time_start) / total_repeat_times
     return mean_cycle, max_cycle
+
+
+def decode_phase_timing(profile_hwl, time_ref_hwl, P):
+    """Decode one dense iteration split into compute, all-reduce, and control.
+
+    Phase means are additive because adjacent timestamp differences are taken
+    per PE before averaging. ``max_pe_cycles`` values are diagnostic and must
+    not be added because a different PE may be slowest in each phase.
+    """
+    marker_count = 5
+    markers = np.zeros((P, P, marker_count), dtype=np.int64)
+    word = np.zeros(3, dtype=np.uint16)
+
+    for h in range(P):
+        for w in range(P):
+            for marker in range(marker_count):
+                first = int(float_to_hex(profile_hwl[h, w, 2 * marker]), 16)
+                second = int(float_to_hex(profile_hwl[h, w, 2 * marker + 1]), 16)
+                word[:] = (
+                    first & 0xffff,
+                    (first >> 16) & 0xffff,
+                    second & 0xffff,
+                )
+                markers[h, w, marker] = make_u48(word)
+
+    # Apply the same per-PE clock alignment used by decode_timing().
+    time_ref = np.zeros((P, P), dtype=np.int64)
+    for h in range(P):
+        for w in range(P):
+            first = int(float_to_hex(time_ref_hwl[h, w, 0]), 16)
+            second = int(float_to_hex(time_ref_hwl[h, w, 1]), 16)
+            word[:] = (
+                first & 0xffff,
+                (first >> 16) & 0xffff,
+                second & 0xffff,
+            )
+            time_ref[h, w] = make_u48(word) - (w + h)
+    markers -= time_ref[:, :, None]
+
+    intervals = np.diff(markers, axis=2)
+    names = (
+        "control_before",
+        "dense_local_compute",
+        "dense_y_allreduce",
+        "control_after",
+    )
+
+    metrics = {}
+    for index, name in enumerate(names):
+        per_pe = intervals[:, :, index]
+        metrics[name] = {
+            "mean_cycles": float(np.mean(per_pe)),
+            "max_pe_cycles": float(np.max(per_pe)),
+        }
+
+    control = intervals[:, :, 0] + intervals[:, :, 3]
+    total = markers[:, :, -1] - markers[:, :, 0]
+    metrics["control_and_markers"] = {
+        "mean_cycles": float(np.mean(control)),
+        "max_pe_cycles": float(np.max(control)),
+    }
+    metrics["profile_iteration"] = {
+        "mean_cycles": float(np.mean(total)),
+        "max_pe_cycles": float(np.max(total)),
+    }
+    return metrics

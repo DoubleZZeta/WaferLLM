@@ -1,0 +1,124 @@
+"""Shared host-side numpy helpers for MeshGEMV (no Cerebras SDK imports).
+
+Imported by both launch_sim.py (cs_python / runtime SDK) and launch_device.py
+(appliance python / client SDK).
+"""
+import struct
+
+import numpy as np
+
+
+def cfg_name(P, M, N, group_num):
+    """Per-config suffix used for compile artifacts (out_<cfg>, artifact_<cfg>.json)."""
+    return f"{P}_{M // P}_{N // P}_{group_num}"
+
+
+def float_to_hex(f):
+    return hex(struct.unpack("<I", struct.pack("<f", f))[0])
+
+
+def make_u48(words):
+    return words[0] + (words[1] << 16) + (words[2] << 32)
+
+
+def make_inputs(P, M, N):
+    """Random row-vector X (replicated across PE columns) and matrix W."""
+    Mt = M // P
+    X = np.random.rand(1, M).astype(np.float16)
+    tensor_X = np.tile(X.reshape(P, Mt), reps=(1, P))
+    tensor_W = np.random.rand(M, N).astype(np.float16)
+    return X, tensor_X, tensor_W
+
+
+def tile_vector(vector, P):
+    """Partition a 1×D vector across PE rows and replicate across columns."""
+    _, D = vector.shape
+
+    if D % P != 0:
+        raise ValueError(f"vector dimension {D} must be divisible by P={P}")
+
+    Dt = D // P
+    return np.tile(vector.reshape(P, Dt), reps=(1, P))
+
+
+def make_low_rank_inputs(P, M, R, N, seed=2025):
+    """Generate SVD-derived rank-R factors with PE-ready tensors."""
+
+    if M % P != 0:
+        raise ValueError(f"M={M} must be divisible by P={P}")
+    if R % P != 0:
+        raise ValueError(f"R={R} must be divisible by P={P}")
+    if N % P != 0:
+        raise ValueError(f"N={N} must be divisible by P={P}")
+    if R > min(M, N):
+        raise ValueError(
+            f"R={R} cannot exceed min(M, N)={min(M, N)}"
+        )
+    rng = np.random.default_rng(seed)
+
+    X = rng.standard_normal((1, M), dtype=np.float32)
+    W = rng.standard_normal((M, N), dtype=np.float32) / np.sqrt(M)
+    U, S, Vh = np.linalg.svd(W, full_matrices=False)
+    sqrt_S = np.sqrt(S[:R])
+    A = U[:, :R] * sqrt_S[None, :]
+    B = sqrt_S[:, None] * Vh[:R, :]
+
+    # Device inputs use FP16.
+    X = X.astype(np.float16)
+    W = W.astype(np.float16)
+    A = A.astype(np.float16)
+    B = B.astype(np.float16)
+
+    # Convert to MeshGEMV PE layouts.
+    tensor_X = tile_vector(X, P)
+
+    return X, tensor_X, W, A, B 
+
+def tile_W(tensor_W, P, Mt, Nt):
+    W1 = tensor_W.reshape(P, Mt, P, Nt)
+    W2 = W1.transpose(0, 2, 1, 3)
+    return W2.reshape(P, P, Mt * Nt).ravel()
+
+
+def decode_timing(time_memcpy_hwl, time_ref_hwl, P, total_repeat_times):
+    """Decode the on-chip TSC timestamps into (mean_cycle, max_cycle)."""
+    time_start = np.zeros((P, P)).astype(int)
+    time_end = np.zeros((P, P)).astype(int)
+    word = np.zeros(3).astype(np.uint16)
+    for w in range(P):
+        for h in range(P):
+            hex_t0 = int(float_to_hex(time_memcpy_hwl[(h, w, 0)]), base=16)
+            hex_t1 = int(float_to_hex(time_memcpy_hwl[(h, w, 1)]), base=16)
+            hex_t2 = int(float_to_hex(time_memcpy_hwl[(h, w, 2)]), base=16)
+            word[0] = hex_t0 & 0x0000ffff
+            word[1] = (hex_t0 >> 16) & 0x0000ffff
+            word[2] = hex_t1 & 0x0000ffff
+            time_start[(h, w)] = make_u48(word)
+            word[0] = (hex_t1 >> 16) & 0x0000ffff
+            word[1] = hex_t2 & 0x0000ffff
+            word[2] = (hex_t2 >> 16) & 0x0000ffff
+            time_end[(h, w)] = make_u48(word)
+
+    time_ref = np.zeros((P, P)).astype(int)
+    word = np.zeros(3).astype(np.uint16)
+    for w in range(P):
+        for h in range(P):
+            hex_t0 = int(float_to_hex(time_ref_hwl[(h, w, 0)]), base=16)
+            hex_t1 = int(float_to_hex(time_ref_hwl[(h, w, 1)]), base=16)
+            word[0] = hex_t0 & 0x0000ffff
+            word[1] = (hex_t0 >> 16) & 0x0000ffff
+            word[2] = hex_t1 & 0x0000ffff
+            time_ref[(h, w)] = make_u48(word)
+
+    for py in range(P):
+        for px in range(P):
+            time_ref[(py, px)] = time_ref[(py, px)] - (px + py)
+
+    time_start = time_start - time_ref
+    time_end = time_end - time_ref
+
+    min_time_start = time_start.min()
+    max_time_end = time_end.max()
+    mean_cycle = np.mean(time_end - time_start) / total_repeat_times
+    max_cycle = (max_time_end - min_time_start) / total_repeat_times
+    return mean_cycle, max_cycle

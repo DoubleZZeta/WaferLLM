@@ -1,0 +1,13 @@
+SDK image: sdk-cbcore-2.10.0-sdk-202604101435-4586d3f0d8.sif
+Command inside image: python check_sdk_ring.py
+Uses the unmodified native local streamer writer with isolated synthetic state.
+No simulator/kernel execution or modification of installed SDK files.
+
+capacity_bytes: 104857600
+read_index: 0
+write_index: 104857604
+first_unread_word: 0xdeadbeef
+CONFIRMED: native SDK writer overwrote unread data after 100 MiB
+
+Separate source-buffer lifetime check: a 262144-element blocking H2D of 7,
+followed immediately by filling the source with 9, read back 262144 copies of 7.

@@ -6,5 +6,5 @@ if [ -z "$CONFIG" ]; then
     exit 1
 fi
 
-python compile.py --mode sim --config "$CONFIG"
+python3 compile.py --mode sim --config "$CONFIG"
 cs_python launch_sim.py --config "$CONFIG"

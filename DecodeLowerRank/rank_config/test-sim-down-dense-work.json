@@ -1,0 +1,9 @@
+{
+    "rank_q": 8,
+    "rank_k": 8,
+    "rank_v": 8,
+    "rank_o": 8,
+    "rank_gate": 8,
+    "rank_up": 8,
+    "rank_down": 32
+}
