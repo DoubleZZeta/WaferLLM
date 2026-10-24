@@ -1,0 +1,99 @@
+// Fused low-rank GEMV layout.
+//
+// The logical operation is
+//
+//   Z = X @ A      X: [1, M], A: [M, R]
+//   Y = Z @ B      B: [R, N], Y: [1, N]
+//
+// A Px x Py rectangle is used. Stage 1 reduces along Y (PE rows), then stage 2
+// reduces along X (PE columns). Both axis-specific route sets are installed by
+// comm_pe.csl during initialization and remain resident together.
+
+param PROFILE: i16;
+param SERIAL: i16;
+param Px: i16;
+param Py: i16;
+param Mt: i16;  // M / Py: input values owned by each PE row
+param Rt: i16;  // R / Px: rank values owned by each PE column
+param Nt: i16;  // N / Py: output values owned by each PE row after stage 2
+
+param pe_num_group_x: i16;
+param pe_num_group_y: i16;
+param root_1st_phase_x: i16;
+param root_1st_phase_y: i16;
+param root_2nd_phase_x: i16;
+param root_2nd_phase_y: i16;
+
+// The two axes have distinct colors and therefore distinct resident routes.
+// The kernel selects a direction through its queue/DSD, not by rewriting the
+// routes of a shared color between stages.
+const C_Y_GROUP_0: color = @get_color(5);
+const C_Y_GROUP_1: color = @get_color(6);
+const C_Y_ROOT_0: color = @get_color(7);
+const C_Y_ROOT_1: color = @get_color(8);
+const C_Y_BCAST: color = @get_color(9);
+const C_X_GROUP_0: color = @get_color(12);
+const C_X_GROUP_1: color = @get_color(13);
+const C_X_ROOT_0: color = @get_color(14);
+const C_X_ROOT_1: color = @get_color(15);
+const C_X_BCAST: color = @get_color(16);
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width = Px,
+    .height = Py,
+});
+
+layout {
+    @set_rectangle(Px, Py);
+
+    var px: i16 = 0;
+    while (px < Px) : (px += 1) {
+        const memcpy_params = memcpy.get_params(px);
+
+        var py: i16 = 0;
+        while (py < Py) : (py += 1) {
+            @set_tile_code(px, py, "meshgemv.csl", .{
+                .memcpy_params = memcpy_params,
+                .PROFILE = PROFILE,
+                .SERIAL = SERIAL,
+                .y_group_color_0 = C_Y_GROUP_0,
+                .y_group_color_1 = C_Y_GROUP_1,
+                .y_root_color_0 = C_Y_ROOT_0,
+                .y_root_color_1 = C_Y_ROOT_1,
+                .y_bcast_color = C_Y_BCAST,
+                .x_group_color_0 = C_X_GROUP_0,
+                .x_group_color_1 = C_X_GROUP_1,
+                .x_root_color_0 = C_X_ROOT_0,
+                .x_root_color_1 = C_X_ROOT_1,
+                .x_bcast_color = C_X_BCAST,
+                .Px = Px,
+                .Py = Py,
+                .Mt = Mt,
+                .Rt = Rt,
+                .Nt = Nt,
+                .pe_num_group_x = pe_num_group_x,
+                .pe_num_group_y = pe_num_group_y,
+                .root_1st_phase_x = root_1st_phase_x,
+                .root_1st_phase_y = root_1st_phase_y,
+                .root_2nd_phase_x = root_2nd_phase_x,
+                .root_2nd_phase_y = root_2nd_phase_y,
+                .px_id = px,
+                .py_id = py,
+            });
+        }
+    }
+
+    // Only host-visible tensors are exported. Z never leaves the wafer.
+    @export_name("X", [*]f16, true);
+    @export_name("A", [*]f16, true);
+    @export_name("B", [*]f16, true);
+    @export_name("res", [*]f16, true);
+
+    @export_name("init_task", fn()void);
+    @export_name("meshgemv_host", fn(i16, i16)void);
+    @export_name("meshgemv_profile_host", fn(i16)void);
+
+    @export_name("time_memcpy", [*]f32, true);
+    @export_name("time_ref", [*]f32, true);
+    @export_name("profile_time", [*]f32, true);
+}

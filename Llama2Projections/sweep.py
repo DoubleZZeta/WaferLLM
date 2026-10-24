@@ -125,6 +125,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--retained-work-ratios", type=bench.comma_floats, default=[],
         help="comma-separated target R(M+N)/(MN); R is rounded to a multiple of P",
     )
+    subcommands.add_parser("fused-pipelining", help="run two-chunk low-rank pipeline")
+    subcommands.add_parser("fused-chunked", help="run experimental rank-chunk pipeline; use fused-chunked --help")
     subcommands.add_parser("fused-rectangular", help="run rectangular low-rank GEMV; use fused-rectangular --help")
     subcommands.add_parser("dense-rectangular", help="run rectangular dense GEMV; use dense-rectangular --help")
     summary = subcommands.add_parser("summary",
@@ -340,6 +342,12 @@ def run_command(args: argparse.Namespace, run_dir, config: dict) -> int:
 def main(argv: list[str] | None = None) -> int:
     import sys
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "fused-pipelining":
+        import rectangular
+        return rectangular.main(arguments[1:], mode="sweep", execution="pipelining")
+    if arguments and arguments[0] == "fused-chunked":
+        import rectangular
+        return rectangular.main(arguments[1:], mode="sweep", execution="chunked")
     if arguments and arguments[0] == "dense-rectangular":
         import rectangular
         return rectangular.main(arguments[1:], mode="sweep", execution="dense")

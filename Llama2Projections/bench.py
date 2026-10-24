@@ -158,8 +158,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--retained-work-ratios", type=comma_floats, default=DEFAULT_RATIOS,
         help="target R(M+N)/(MN) values (default: .125,.25,.5,.75)",
     )
+    subcommands.add_parser("fused-chunked", help="run experimental rank-chunk pipeline; use fused-chunked --help")
     subcommands.add_parser("fused-rectangular", help="run rectangular low-rank GEMV; use fused-rectangular --help")
     subcommands.add_parser("dense-rectangular", help="run rectangular dense GEMV; use dense-rectangular --help")
+    subcommands.add_parser("fused-pipelining", help="run two-chunk low-rank pipeline; use fused-pipelining --help")
     summary = subcommands.add_parser(
         "summary", help="rebuild the summary CSVs from dense.csv and fused.csv"
     )
@@ -538,6 +540,14 @@ def run_case(
             phase_rows = [{"phase": phase, **metrics} for phase, metrics in result["phases"].items()]
             write_rows(log_path.with_suffix(".phases.csv"),
                        ("phase", "mean_cycles", "max_pe_cycles"), phase_rows)
+        if row.get("chunks") and result.get("phases"):
+            launch = commands[-1]
+            artifact = Path(launch[launch.index("--out-dir") + 1])
+            if not artifact.is_absolute():
+                artifact = REPO_DIR / artifact
+            # Preserve detailed events with the logs even if builds are removed.
+            timeline = json.loads((artifact / "chunk_timeline.json").read_text())
+            log_path.with_suffix(".timeline.json").write_text(json.dumps(timeline) + "\n")
         row["status"] = "ok"
     except Exception as exc:  # preserve partial progress in long sweeps
         row["error_message"] = str(exc)
@@ -687,12 +697,20 @@ def print_summary(run_dir: Path, block_rows: list[dict]) -> None:
 def main(argv: list[str] | None = None) -> int:
     import sys
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "fused-chunked":
+        import rectangular
+        return rectangular.main(arguments[1:], mode="bench", execution="chunked")
     if arguments and arguments[0] == "dense-rectangular":
         import rectangular
         return rectangular.main(arguments[1:], mode="bench", execution="dense")
     if arguments and arguments[0] == "fused-rectangular":
         import rectangular
         return rectangular.main(arguments[1:], mode="bench")
+    if arguments and arguments[0] == "fused-pipelining":
+        import rectangular
+        return rectangular.main(
+            arguments[1:], mode="bench", execution="pipelining"
+        )
     args = parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.run_name):
         raise SystemExit(

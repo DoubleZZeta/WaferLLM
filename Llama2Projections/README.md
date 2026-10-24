@@ -339,3 +339,32 @@ mode; if necessary, collect them separately with `run.sh dense --P 64
 --group-num 8 --profile-phases`. Keep distinct labels for speedup relative to
 fixed dense 64x64, same-grid dense, and best measured dense. The 45-case suite
 supports the latter two comparisons as additional controls.
+
+### Two-chunk pipelining kernel
+
+`fused-pipelining` selects `MeshGEMVLowerRankPipelining` in both `run.sh`
+(fixed projection shapes) and `run_sweep.sh` (custom M/N sweeps). It uses
+identical seeded direct factors and timing conventions to `fused-rectangular`.
+The kernel has two fixed rank chunks and requires `R/PX >= 2`.
+Use `--schedule pipeline` (default) or `--schedule serial` for the matched
+non-overlapping control. `--profile-phases` records the same schedule with
+timestamps; omit it for speed comparisons. Results are written to `fused-pipelining.csv`.
+Use different run names for the baseline and pipeline: each run locks its kernel.
+
+```bash
+# From Llama2Projections, in the SDK environment:
+bash run.sh fused-pipelining pipeline_qkvo_r768 \
+  --PX 64 --PY 64 --group-num-x 8 --group-num-y 8 \
+  --projections qkvo --ranks 768 --repetitions 3 --suppress-simfab-trace
+bash run.sh fused-rectangular baseline_qkvo_r768 \
+  --PX 64 --PY 64 --group-num-x 8 --group-num-y 8 \
+  --projections qkvo --ranks 768 --repetitions 3 --suppress-simfab-trace
+
+# Small foreground integration check (no tmux):
+python3 sweep.py fused-pipelining --run-name pipeline_small \
+  --PX 4 --PY 4 --group-num-x 2 --group-num-y 2 \
+  --M 64 --N 128 --ranks 20 --repetitions 3 --suppress-simfab-trace
+```
+
+Existing `--build-root`, `--resume`, and `--dry-run` options are supported.
+No full performance sweep is started automatically.

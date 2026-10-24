@@ -1,0 +1,450 @@
+// Fused two-stage low-rank GEMV PE program.
+//
+// Data placement:
+//   * PE row py owns X[py * Mt : (py + 1) * Mt].
+//   * PE (py, px) owns A block [py, px].
+//   * After the Y all-reduce, every PE in column px owns Z chunk px.
+//   * PE (py, px) owns B[rank block px, output block py].
+//   * The X all-reduce sums rank-block contributions, leaving output chunk py
+//     replicated across every PE column.
+
+param memcpy_params;
+param y_group_color_0: color;
+param y_group_color_1: color;
+param y_root_color_0: color;
+param y_root_color_1: color;
+param y_bcast_color: color;
+param x_group_color_0: color;
+param x_group_color_1: color;
+param x_root_color_0: color;
+param x_root_color_1: color;
+param x_bcast_color: color;
+param px_id: i16;
+param py_id: i16;
+
+param PROFILE: i16;
+param SERIAL: i16;
+param Px: i16;
+param Py: i16;
+param Mt: i16;
+param Rt: i16;
+param Nt: i16;
+param pe_num_group_x: i16;
+param pe_num_group_y: i16;
+param root_1st_phase_x: i16;
+param root_1st_phase_y: i16;
+param root_2nd_phase_x: i16;
+param root_2nd_phase_y: i16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_module = @import_module("<layout>");
+const math = @import_module("<math>");
+
+const on_z_chunk_ready_task_id = @get_local_task_id(12);
+var current_chunk: i16 = 0;
+const comm_mod = @import_module("comm_lib/comm_pe.csl", .{
+    .Px = Px,
+    .Py = Py,
+    .Rt = Rt,
+    .Nt = Nt,
+    .pe_num_group_x = pe_num_group_x,
+    .pe_num_group_y = pe_num_group_y,
+    .root_1st_phase_x = root_1st_phase_x,
+    .root_1st_phase_y = root_1st_phase_y,
+    .root_2nd_phase_x = root_2nd_phase_x,
+    .root_2nd_phase_y = root_2nd_phase_y,
+    .y_group_color_0 = y_group_color_0,
+    .y_group_color_1 = y_group_color_1,
+    .y_root_color_0 = y_root_color_0,
+    .y_root_color_1 = y_root_color_1,
+    .y_bcast_color = y_bcast_color,
+    .x_group_color_0 = x_group_color_0,
+    .x_group_color_1 = x_group_color_1,
+    .x_root_color_0 = x_root_color_0,
+    .x_root_color_1 = x_root_color_1,
+    .x_bcast_color = x_bcast_color,
+    .px_id = px_id,
+    .py_id = py_id,
+    .on_z_chunk_ready_task_id = on_z_chunk_ready_task_id,
+});
+const split = Rt / 2;
+// FP16 fabric transfers use packed words. Never share a word across chunks.
+const z1_offset = split + split % 2;
+const Z_STORAGE = ((Rt + split % 2 + 1) / 2) * 2;
+
+
+var px: i16 = 0;
+var py: i16 = 0;
+var quotient_x: i16 = 0;
+var remainder_x: i16 = 0;
+var quotient_y: i16 = 0;
+var remainder_y: i16 = 0;
+
+// --------------------------- Host-visible tensors ------------------------- //
+
+var X_tile: [Mt]f16 = @zeros([Mt]f16);
+var ptr_X: [*]f16 = &X_tile;
+var X_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> X_tile[i] });
+
+// A is row-major [Mt, Rt]. Advancing the mapped X index advances one A row.
+var A_tile: [Mt * Rt]f16 = @zeros([Mt * Rt]f16);
+var ptr_A: [*]f16 = &A_tile;
+
+// B is row-major [Rt, Nt]. Its unusual *host-side* block placement lets stage
+// 2 reduce horizontally without transposing Z on wafer.
+var B_tile: [Rt * Nt]f16 = @zeros([Rt * Nt]f16);
+var ptr_B: [*]f16 = &B_tile;
+var B_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> B_tile[i] });
+
+var res_tile: [Nt]f16 = @zeros([Nt]f16);
+var ptr_res: [*]f16 = &res_tile;
+var res_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> res_tile[i] });
+
+// ---------------------------- On-wafer intermediate ----------------------- //
+
+// Z is deliberately not exported. The main purpose of fusion is to keep this
+// rank-R intermediate on wafer between the two matrix-vector products.
+var Z_tile: [Z_STORAGE]f16 = @zeros([Z_STORAGE]f16);
+var ptr_Z: [*]f16 = &Z_tile;
+var Z_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Rt} -> Z_tile[i] });
+
+var z0_reduce_ready: bool = false;
+var z1_compute_ready: bool = false;
+var z1_reduce_ready: bool = false;
+var y0_compute_ready: bool = false;
+var pipeline2_start: bool = false;
+var pipeline3_start: bool = false;
+
+// One DSR bank is reused by both GEMVs; stage 2 reloads all three registers
+// with the appropriate result and weight descriptors.
+const compute_dest_dsr = @get_dsr(dsr_dest, 1);
+const compute_src0_dsr = @get_dsr(dsr_src0, 1);
+const compute_src1_dsr = @get_dsr(dsr_src1, 1);
+const chunk_a_xdsr = @get_xdsr(0);
+const chunk_a_sr0 = @get_sr(0);
+const chunk_a_sr1 = @get_sr(1);
+const chunk_a_sr2 = @get_sr(2);
+
+
+
+fn stage1_step(cur_x: f16) void {
+    // Vector FMA: Z[0:Rt] += A[current row, 0:Rt] * cur_x.
+    @fmach(compute_dest_dsr, compute_src0_dsr, compute_src1_dsr, cur_x);
+}
+
+fn stage1_local_xa_chunked(comptime offset: i16, comptime length: i16) void{
+    var Z_chunk = @increment_dsd_offset(Z_dsd, if (offset == 0) 0 else z1_offset, f16);
+    Z_chunk = @set_dsd_length(Z_chunk, @as(u16, length));
+    var A_chunk = @get_dsd(mem4d_dsd, .{
+        .tensor_access = |i, j|{Mt, length} -> A_tile[i * Rt + offset + j]
+    });
+
+    @fmovh(Z_chunk, 0.0);
+    @load_to_dsr(compute_dest_dsr, Z_chunk, .{ .save_address = false });
+    @load_to_dsr(compute_src0_dsr, Z_chunk, .{ .save_address = false });
+    @load_to_dsr_xdsr_sr(compute_src1_dsr, chunk_a_xdsr,
+        .{chunk_a_sr0, chunk_a_sr1, chunk_a_sr2}, A_chunk,
+        .{ .save_address = true });
+    @map(stage1_step, X_dsd);
+}
+
+
+fn stage2_step(cur_z: f16) void {
+    // Vector FMA: res[0:Nt] += B[current rank row, 0:Nt] * cur_z.
+    @fmach(compute_dest_dsr, compute_src0_dsr, compute_src1_dsr, cur_z);
+}
+
+fn stage2_local_zb_chunked(comptime offset:i16, comptime length:i16) void {
+    var B_chunk = @increment_dsd_offset(B_dsd, offset * Nt, f16);
+    var Z_chunk = @increment_dsd_offset(Z_dsd, if (offset == 0) 0 else z1_offset, f16);
+    Z_chunk = @set_dsd_length(Z_chunk, @as(u16, length));
+    @load_to_dsr(compute_dest_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(compute_src0_dsr, res_dsd, .{ .save_address = false });
+    @load_to_dsr(compute_src1_dsr, B_chunk, .{ .save_address = true });
+    @map(stage2_step, Z_chunk);
+}
+// ------------------------------- Execution loop --------------------------- //
+
+var total_repeat_times: i16 = 1;
+var total_warmup_times: i16 = 0;
+var repeat_times: i16 = 0;
+// Profile-only dispatch state; normal builds eliminate its callback branch.
+var profile_measured_iteration: bool = false;
+
+fn init_task() void {
+    timestamp.enable_tsc();
+    @assert(Px >= 3);
+    @assert(Py >= 3);
+
+    px = @as(i16, layout_module.get_x_coord());
+    py = @as(i16, layout_module.get_y_coord());
+
+    quotient_x = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_group_x)));
+    remainder_x = px - quotient_x * pe_num_group_x;
+    quotient_y = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_group_y)));
+    remainder_y = py - quotient_y * pe_num_group_y;
+
+    // init() installs both independent route sets; neither is changed later.
+    comm_mod.init(px, py, quotient_x, remainder_x, quotient_y, remainder_y);
+    sys_mod.unblock_cmd_stream();
+}
+
+// Y readiness is recorded in the kernel callback, so it includes callback delay.
+fn on_z_chunk_ready_impl(comptime profiled: bool) void {
+    if (current_chunk == 0) {
+        mark(profiled, 4); // Y0 ready
+        z0_reduce_ready = true;
+        try_pipeline_stage2(profiled);
+    } else {
+        mark(profiled, 8); // Y1 ready
+        z1_reduce_ready = true;
+        try_pipeline_stage3(profiled);
+    }
+}
+
+fn try_pipeline_stage3(comptime profiled: bool) void {
+    if (y0_compute_ready and z1_reduce_ready and !pipeline3_start) {
+        pipeline3_start = true;
+        mark(profiled, 11); // B1 start
+        stage2_local_zb_chunked(split, Rt - split);
+        mark(profiled, 12); // B1 end
+        mark(profiled, 13); // final X start
+        comm_mod.allreduce_nt_x(ptr_res);
+        mark(profiled, 14); // final X end
+        // Return through the same kind of dispatcher as the original kernel.
+        if (PROFILE == 1) {
+            meshgemv_profile_entry();
+        } else {
+            meshgemv_entry();
+        }
+    }
+}
+
+fn compute_b0(comptime profiled: bool) void {
+    mark(profiled, 9);
+    stage2_local_zb_chunked(0, split);
+    mark(profiled, 10);
+    y0_compute_ready = true;
+}
+
+fn launch_y1(comptime profiled: bool) void {
+    current_chunk = 1;
+    mark(profiled, 7);
+    comm_mod.allreduce_rt_y_chunk(@ptrcast([*]f16, &Z_tile[z1_offset]), Rt - split);
+}
+
+fn try_pipeline_stage2(comptime profiled: bool) void {
+    if (z0_reduce_ready and z1_compute_ready and !pipeline2_start) {
+        pipeline2_start = true;
+        // SERIAL changes launch order only: identical chunks and callbacks.
+        if (SERIAL == 1) {
+            compute_b0(profiled);
+            launch_y1(profiled);
+        } else {
+            launch_y1(profiled);
+            compute_b0(profiled);
+        }
+        try_pipeline_stage3(profiled);
+    }
+}
+
+fn compute_a1(comptime profiled: bool) void {
+    mark(profiled, 5);
+    stage1_local_xa_chunked(split, Rt - split);
+    mark(profiled, 6);
+    z1_compute_ready = true;
+}
+
+fn launch_y0(comptime profiled: bool) void {
+    mark(profiled, 3);
+    comm_mod.allreduce_rt_y_chunk(ptr_Z, split);
+}
+
+fn fused_iteration(comptime profiled: bool) void {
+    z0_reduce_ready = false;
+    z1_compute_ready = false;
+    z1_reduce_ready = false;
+    y0_compute_ready = false;
+    pipeline2_start = false;
+    pipeline3_start = false;
+    current_chunk = 0;
+    @fmovh(res_dsd, 0.0);
+    mark(profiled, 1);
+    stage1_local_xa_chunked(0, split);
+    mark(profiled, 2);
+    if (SERIAL == 1) {
+        compute_a1(profiled);
+        launch_y0(profiled);
+    } else {
+        launch_y0(profiled);
+        compute_a1(profiled);
+    }
+    try_pipeline_stage2(profiled);
+}
+
+// Async callbacks need one dispatch decision; individual markers have no
+// runtime conditional. PROFILE=0 removes even this dispatch from normal builds.
+task on_z_chunk_ready() void {
+    if (PROFILE == 1) {
+        if (profile_measured_iteration) {
+            on_z_chunk_ready_impl(true);
+            return;
+        }
+    }
+    on_z_chunk_ready_impl(false);
+}
+
+// Normal and diagnostic paths share a compile-time-specialised schedule.
+// false emits no internal markers; true emits unconditional timestamps.
+fn meshgemv_host(warmups: i16, repeats: i16) void {
+    @assert(PROFILE == 0);
+    total_warmup_times = warmups;
+    total_repeat_times = repeats;
+    repeat_times = 0;
+    meshgemv_entry();
+}
+
+fn meshgemv_profile_host(warmups: i16) void {
+    @assert(PROFILE == 1);
+    profile_measured_iteration = false;
+    total_warmup_times = warmups;
+    total_repeat_times = 1;
+    repeat_times = 0;
+    meshgemv_profile_entry();
+}
+
+fn meshgemv_entry() void {
+    if (repeat_times == total_repeat_times + total_warmup_times) {
+        exit();
+    } else {
+        if (repeat_times == total_warmup_times) {
+            timestamp.get_timestamp(&tscRefBuffer);
+            timestamp.get_timestamp(&tscStartBuffer);
+        }
+        repeat_times += 1;
+        fused_iteration(false);
+    }
+}
+
+// Mirrors the original low-rank profiler: unmarked warmups, one marked
+// iteration, and a loop-end marker when the final collective returns here.
+fn meshgemv_profile_entry() void {
+    if (profile_measured_iteration) {
+        mark(true, 15);
+        profile_measured_iteration = false;
+    }
+    if (repeat_times == total_repeat_times + total_warmup_times) {
+        exit_profile();
+    } else if (repeat_times == total_warmup_times) {
+        timestamp.get_timestamp(&tscRefBuffer);
+        timestamp.get_timestamp(&tscStartBuffer);
+        mark(true, 0);
+        repeat_times += 1;
+        profile_measured_iteration = true;
+        fused_iteration(true);
+    } else {
+        repeat_times += 1;
+        fused_iteration(false);
+    }
+}
+
+// --------------------------------- Timing --------------------------------- //
+
+const timestamp = @import_module("<time>");
+var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscRefBuffer = @zeros([timestamp.tsc_size_words]u16);
+
+// Event IDs are shared with PROFILE_EVENTS in host_common.py.
+// They are NOT consecutive phase boundaries: Y and compute can overlap.
+var profile_marks = @zeros([16 * timestamp.tsc_size_words]u16);
+var profile_time_f32 = @zeros([32]f32);
+var ptr_profile_time: [*]f32 = &profile_time_f32;
+
+fn mark(comptime profiled: bool, comptime event: i16) void {
+    // Both conditions are compile-time; no per-event warmup check is emitted.
+    if (PROFILE == 1 and profiled) {
+        timestamp.get_timestamp(@ptrcast(*[3]u16, &profile_marks[3 * event]));
+    }
+}
+
+// Three f32 words carry two packed 48-bit timestamps back to the host.
+var time_buf_f32 = @zeros([3]f32);
+var ptr_time_memcpy: [*]f32 = &time_buf_f32;
+var time_ref_f32 = @zeros([2]f32);
+var ptr_time_ref: [*]f32 = &time_ref_f32;
+
+fn exit() void {
+    timestamp.get_timestamp(&tscEndBuffer);
+    timestamp.disable_tsc();
+    f_reference_timestamps();
+    f_memcpy_timestamps();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn exit_profile() void {
+    timestamp.get_timestamp(&tscEndBuffer);
+    timestamp.disable_tsc();
+    f_reference_timestamps();
+    f_memcpy_timestamps();
+    f_profile_timestamps();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn pack_profile_timestamp(tsc_buffer: [*]u16, output_offset: i16) void {
+    var lo_: u16 = tsc_buffer[0];
+    var hi_: u16 = tsc_buffer[1];
+    profile_time_f32[output_offset] = @bitcast(
+        f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_)
+    );
+
+    lo_ = tsc_buffer[2];
+    hi_ = 0;
+    profile_time_f32[output_offset + 1] = @bitcast(
+        f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_)
+    );
+}
+
+fn f_profile_timestamps() void {
+    for (@range(i16, 16)) |i| {
+        pack_profile_timestamp(@ptrcast([*]u16, &profile_marks[3 * i]), 2 * i);
+    }
+}
+
+fn f_memcpy_timestamps() void {
+    var lo_: u16 = tscStartBuffer[0];
+    var hi_: u16 = tscStartBuffer[1];
+    time_buf_f32[0] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+
+    lo_ = tscStartBuffer[2];
+    hi_ = tscEndBuffer[0];
+    time_buf_f32[1] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+
+    lo_ = tscEndBuffer[1];
+    hi_ = tscEndBuffer[2];
+    time_buf_f32[2] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+}
+
+fn f_reference_timestamps() void {
+    var lo_: u16 = tscRefBuffer[0];
+    var hi_: u16 = tscRefBuffer[1];
+    time_ref_f32[0] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+
+    lo_ = tscRefBuffer[2];
+    hi_ = 0;
+    time_ref_f32[1] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+}
+
+comptime {
+    @export_symbol(ptr_X, "X");
+    @export_symbol(ptr_A, "A");
+    @export_symbol(ptr_B, "B");
+    @export_symbol(ptr_res, "res");
+    @export_symbol(ptr_time_memcpy, "time_memcpy");
+    @export_symbol(ptr_time_ref, "time_ref");
+    @export_symbol(ptr_profile_time, "profile_time");
+    @export_symbol(init_task);
+    @export_symbol(meshgemv_host);
+    @export_symbol(meshgemv_profile_host);
+    @bind_local_task(on_z_chunk_ready, on_z_chunk_ready_task_id);
+}

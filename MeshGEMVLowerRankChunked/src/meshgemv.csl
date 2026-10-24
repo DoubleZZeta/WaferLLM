@@ -1,0 +1,326 @@
+// Fused two-stage low-rank GEMV PE program.
+//
+// Data placement:
+//   * PE row py owns X[py * Mt : (py + 1) * Mt].
+//   * PE (py, px) owns A block [py, px].
+//   * After the Y all-reduce, every PE in column px owns Z chunk px.
+//   * PE (py, px) owns B[rank block px, output block py].
+//   * The X all-reduce sums rank-block contributions, leaving output chunk py
+//     replicated across every PE column.
+
+param memcpy_params;
+param y_group_color_0: color;
+param y_group_color_1: color;
+param y_root_color_0: color;
+param y_root_color_1: color;
+param y_bcast_color: color;
+param x_group_color_0: color;
+param x_group_color_1: color;
+param x_root_color_0: color;
+param x_root_color_1: color;
+param x_bcast_color: color;
+param px_id: i16;
+param py_id: i16;
+
+param Chunks: i16;
+param Pipeline: i16;
+param Profile: i16;
+const chunk_ready_id = @get_local_task_id(12);
+const compute_chunk_id = @get_local_task_id(13);
+param Px: i16;
+param Py: i16;
+param Mt: i16;
+param Rt: i16;
+param Nt: i16;
+param pe_num_group_x: i16;
+param pe_num_group_y: i16;
+param root_1st_phase_x: i16;
+param root_1st_phase_y: i16;
+param root_2nd_phase_x: i16;
+param root_2nd_phase_y: i16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const layout_module = @import_module("<layout>");
+const math = @import_module("<math>");
+
+const comm_mod = @import_module("comm_lib/comm_pe.csl", .{
+    .y_done = chunk_ready_id,
+    .Px = Px,
+    .Py = Py,
+    .Rt = Rt,
+    .Nt = Nt,
+    .pe_num_group_x = pe_num_group_x,
+    .pe_num_group_y = pe_num_group_y,
+    .root_1st_phase_x = root_1st_phase_x,
+    .root_1st_phase_y = root_1st_phase_y,
+    .root_2nd_phase_x = root_2nd_phase_x,
+    .root_2nd_phase_y = root_2nd_phase_y,
+    .y_group_color_0 = y_group_color_0,
+    .y_group_color_1 = y_group_color_1,
+    .y_root_color_0 = y_root_color_0,
+    .y_root_color_1 = y_root_color_1,
+    .y_bcast_color = y_bcast_color,
+    .x_group_color_0 = x_group_color_0,
+    .x_group_color_1 = x_group_color_1,
+    .x_root_color_0 = x_root_color_0,
+    .x_root_color_1 = x_root_color_1,
+    .x_bcast_color = x_bcast_color,
+    .px_id = px_id,
+    .py_id = py_id,
+});
+
+var px: i16 = 0;
+var py: i16 = 0;
+var quotient_x: i16 = 0;
+var remainder_x: i16 = 0;
+var quotient_y: i16 = 0;
+var remainder_y: i16 = 0;
+
+// --------------------------- Host-visible tensors ------------------------- //
+
+var X_tile: [Mt]f16 = @zeros([Mt]f16);
+var ptr_X: [*]f16 = &X_tile;
+var X_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> X_tile[i] });
+
+// A is row-major [Mt, Rt]. Advancing the mapped X index advances one A row.
+var A_tile: [Mt * Rt]f16 = @zeros([Mt * Rt]f16);
+var ptr_A: [*]f16 = &A_tile;
+var A_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Rt} -> A_tile[i] });
+
+// B is row-major [Rt, Nt]. Its unusual *host-side* block placement lets stage
+// 2 reduce horizontally without transposing Z on wafer.
+var B_tile: [Rt * Nt]f16 = @zeros([Rt * Nt]f16);
+var ptr_B: [*]f16 = &B_tile;
+var B_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> B_tile[i] });
+
+var res_tile: [Nt]f16 = @zeros([Nt]f16);
+var ptr_res: [*]f16 = &res_tile;
+var res_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> res_tile[i] });
+
+// ---------------------------- On-wafer intermediate ----------------------- //
+
+// Z is deliberately not exported. The main purpose of fusion is to keep this
+// rank-R intermediate on wafer between the two matrix-vector products.
+var Z_tile: [Rt]f16 = @zeros([Rt]f16);
+var ptr_Z: [*]f16 = &Z_tile;
+var Z_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Rt} -> Z_tile[i] });
+
+// One DSR bank is reused by both GEMVs; stage 2 reloads all three registers
+// with the appropriate result and weight descriptors.
+const compute_dest_dsr = @get_dsr(dsr_dest, 1);
+const compute_src0_dsr = @get_dsr(dsr_src0, 1);
+const compute_src1_dsr = @get_dsr(dsr_src1, 1);
+
+fn stage1_step(cur_x: f16) void {
+    // Vector FMA: Z[0:Rt] += A[current row, 0:Rt] * cur_x.
+    @fmach(compute_dest_dsr, compute_src0_dsr, compute_src1_dsr, cur_x);
+}
+
+fn stage1_local_xa() void {
+    @fmovh(Z_dsd, 0.0);
+    @load_to_dsr(compute_dest_dsr, Z_dsd, .{ .save_address = false });
+    @load_to_dsr(compute_src0_dsr, Z_dsd, .{ .save_address = false });
+    @load_to_dsr(compute_src1_dsr, A_dsd, .{ .save_address = true });
+    @map(stage1_step, X_dsd);
+
+}
+
+fn stage2_step(cur_z: f16) void {
+    // Vector FMA: res[0:Nt] += B[current rank row, 0:Nt] * cur_z.
+    @fmach(compute_dest_dsr, compute_src0_dsr, compute_src1_dsr, cur_z);
+}
+
+// Chunk pipeline. Stage 1 is unchanged; stage 2 consumes completed rank
+// chunks in their original order. A single final X all-reduce preserves the
+// baseline output contract. There is at most one active Y collective per PE.
+var total_repeat_times: i16 = 1;
+var total_warmup_times: i16 = 0;
+var repeat_times: i16 = 0;
+var launched_chunks: i16 = 0;
+var ready_chunks: i16 = 0;
+var consumed_chunks: i16 = 0;
+
+const timestamp = @import_module("<time>");
+var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscRefBuffer = @zeros([timestamp.tsc_size_words]u16);
+var time_buf_f32 = @zeros([3]f32);
+var ptr_time_memcpy: [*]f32 = &time_buf_f32;
+var time_ref_f32 = @zeros([2]f32);
+var ptr_time_ref: [*]f32 = &time_ref_f32;
+
+// Four outer boundaries, then (ready, B-start, B-end) for each chunk.
+// Timelines overlap: their durations must not be added as serial phases.
+const marker_count: i16 = 4 + 3 * Chunks;
+var profile_marks = @zeros([3 * marker_count]u16);
+var profile_time_f32 = @zeros([2 * marker_count]f32);
+var ptr_profile_time: [*]f32 = &profile_time_f32;
+
+fn mark(index: i16) void {
+    if (Profile == 1) {
+        timestamp.get_timestamp(@ptrcast(*[3]u16, &profile_marks[3 * index]));
+    }
+}
+
+fn init_task() void {
+    timestamp.enable_tsc();
+    @assert(Px >= 3);
+    @assert(Py >= 3);
+
+    px = @as(i16, layout_module.get_x_coord());
+    py = @as(i16, layout_module.get_y_coord());
+
+    quotient_x = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_group_x)));
+    remainder_x = px - quotient_x * pe_num_group_x;
+    quotient_y = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_group_y)));
+    remainder_y = py - quotient_y * pe_num_group_y;
+
+    // init() installs both independent route sets; neither is changed later.
+    comm_mod.init(px, py, quotient_x, remainder_x, quotient_y, remainder_y);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn chunk_start(k: i16) i16 {
+    // Put the remainder in the first chunks. All division is compile-time;
+    // a runtime i32 divide here would overwhelm a small GEMV.
+    const extra: i16 = Rt % Chunks;
+    return k * (Rt / Chunks) + (if (k < extra) k else extra);
+}
+
+fn launch_next_y() void {
+    const start = chunk_start(launched_chunks);
+    const end = chunk_start(launched_chunks + 1);
+    launched_chunks += 1;
+    comm_mod.start_y(@ptrcast([*]f16, &Z_tile[start]), end - start);
+}
+
+fn fused_iteration() void {
+    launched_chunks = 0;
+    ready_chunks = 0;
+    consumed_chunks = 0;
+    mark(0);
+    stage1_local_xa();
+    mark(1);
+    @fmovh(res_dsd, 0.0);
+    launch_next_y();
+    // Return to the task scheduler. Completion callbacks advance the pipeline.
+}
+
+task chunk_ready() void {
+    mark(4 + 3 * ready_chunks);
+    ready_chunks += 1;
+    if (Pipeline == 1 and launched_chunks < Chunks) {
+        launch_next_y();
+    }
+    @activate(compute_chunk_id);
+}
+
+task compute_chunk() void {
+    if (consumed_chunks < ready_chunks) {
+        const start = chunk_start(consumed_chunks);
+        const end = chunk_start(consumed_chunks + 1);
+        mark(4 + 3 * consumed_chunks + 1);
+        // Never clear res here: all chunks accumulate into the same output.
+        var z = @increment_dsd_offset(Z_dsd, start, f16);
+        z = @set_dsd_length(z, @as(u16, end - start));
+        const b = @increment_dsd_offset(B_dsd, start * Nt, f16);
+        @load_to_dsr(compute_dest_dsr, res_dsd, .{ .save_address = false });
+        @load_to_dsr(compute_src0_dsr, res_dsd, .{ .save_address = false });
+        @load_to_dsr(compute_src1_dsr, b, .{ .save_address = true });
+        @map(stage2_step, z);
+        mark(4 + 3 * consumed_chunks + 2);
+        consumed_chunks += 1;
+        if (Pipeline == 0 and launched_chunks < Chunks) {
+            launch_next_y();
+        }
+    }
+    if (consumed_chunks == Chunks) {
+        mark(2);
+        comm_mod.allreduce_nt_x(ptr_res);
+        mark(3);
+        meshgemv_entry();
+    } else if (consumed_chunks < ready_chunks) {
+        // Task activations coalesce; the counters ensure no ready chunk is lost.
+        @activate(compute_chunk_id);
+    }
+}
+
+fn meshgemv_host(warmups: i16, repeats: i16) void {
+    total_warmup_times = warmups;
+    total_repeat_times = repeats;
+    repeat_times = 0;
+    meshgemv_entry();
+}
+
+fn meshgemv_profile_host(warmups: i16) void {
+    @assert(Profile == 1);
+    meshgemv_host(warmups, 1);
+}
+
+fn meshgemv_entry() void {
+    if (repeat_times == total_repeat_times + total_warmup_times) {
+        exit();
+    } else {
+        if (repeat_times == total_warmup_times) {
+            timestamp.get_timestamp(&tscRefBuffer);
+            timestamp.get_timestamp(&tscStartBuffer);
+        }
+        repeat_times += 1;
+        fused_iteration();
+    }
+}
+
+fn exit() void {
+    timestamp.get_timestamp(&tscEndBuffer);
+    timestamp.disable_tsc();
+    f_reference_timestamps();
+    f_memcpy_timestamps();
+    if (Profile == 1) {
+        for (@range(i16, marker_count)) |i| {
+            profile_time_f32[2*i] = @bitcast(f32,
+                @as(u32, profile_marks[3*i]) | (@as(u32, profile_marks[3*i+1]) << @as(u16,16)));
+            profile_time_f32[2*i+1] = @bitcast(f32, @as(u32, profile_marks[3*i+2]));
+        }
+    }
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_memcpy_timestamps() void {
+    var lo_: u16 = tscStartBuffer[0];
+    var hi_: u16 = tscStartBuffer[1];
+    time_buf_f32[0] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+
+    lo_ = tscStartBuffer[2];
+    hi_ = tscEndBuffer[0];
+    time_buf_f32[1] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+
+    lo_ = tscEndBuffer[1];
+    hi_ = tscEndBuffer[2];
+    time_buf_f32[2] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+}
+
+fn f_reference_timestamps() void {
+    var lo_: u16 = tscRefBuffer[0];
+    var hi_: u16 = tscRefBuffer[1];
+    time_ref_f32[0] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+
+    lo_ = tscRefBuffer[2];
+    hi_ = 0;
+    time_ref_f32[1] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+}
+
+comptime {
+    @assert(Chunks >= 1 and Chunks <= Rt);
+    @bind_local_task(chunk_ready, chunk_ready_id);
+    @bind_local_task(compute_chunk, compute_chunk_id);
+    @export_symbol(ptr_X, "X");
+    @export_symbol(ptr_A, "A");
+    @export_symbol(ptr_B, "B");
+    @export_symbol(ptr_res, "res");
+    @export_symbol(ptr_time_memcpy, "time_memcpy");
+    @export_symbol(ptr_time_ref, "time_ref");
+    @export_symbol(ptr_profile_time, "profile_time");
+    @export_symbol(init_task);
+    @export_symbol(meshgemv_host);
+    @export_symbol(meshgemv_profile_host);
+}
