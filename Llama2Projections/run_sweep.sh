@@ -5,7 +5,7 @@ set -euo pipefail
 # arguments are passed directly to sweep.py.
 #
 # Usage:
-#   bash run_sweep.sh {dense|fused|dense-rectangular|fused-rectangular} [run_name] [sweep.py options]
+#   bash run_sweep.sh {dense|fused|dense-rectangular|fused-rectangular|fused-chunked|fused-pipelining} [run_name] [sweep.py options]
 #
 # Examples:
 #   bash run_sweep.sh dense square --P 4,8 --group-num 2 --M 256,512 --N 256,512
@@ -19,8 +19,8 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(dirname "$SCRIPT_DIR")
 
-if [ "$#" -lt 1 ] || { [ "$1" != dense ] && [ "$1" != fused ] && [ "$1" != fused-rectangular ] && [ "$1" != dense-rectangular ]; }; then
-    echo "Usage: bash run_sweep.sh {dense|fused|dense-rectangular|fused-rectangular} [run_name] [sweep.py options]" >&2
+if [ "$#" -lt 1 ] || { [ "$1" != dense ] && [ "$1" != fused ] && [ "$1" != fused-rectangular ] && [ "$1" != dense-rectangular ] && [ "$1" != fused-chunked ] && [ "$1" != fused-pipelining ]; }; then
+    echo "Usage: bash run_sweep.sh {dense|fused|dense-rectangular|fused-rectangular|fused-chunked|fused-pipelining} [run_name] [sweep.py options]" >&2
     exit 2
 fi
 SUBCOMMAND=$1
@@ -70,6 +70,6 @@ echo "Started parameter sweep ($SUBCOMMAND)."
 echo "  run:     $RUN_NAME"
 echo "  session: $SESSION_NAME"
 echo "  results: $RUN_DIR/$SUBCOMMAND.csv"
-if [[ "$SUBCOMMAND" != *-rectangular ]]; then echo "  summary: $RUN_DIR/summary.csv"; fi
+if [[ "$SUBCOMMAND" != *-rectangular && "$SUBCOMMAND" != fused-chunked && "$SUBCOMMAND" != fused-pipelining ]]; then echo "  summary: $RUN_DIR/summary.csv"; fi
 echo "  attach:  tmux attach -t $SESSION_NAME"
 echo "  log:     tail -f $RUN_LOG"

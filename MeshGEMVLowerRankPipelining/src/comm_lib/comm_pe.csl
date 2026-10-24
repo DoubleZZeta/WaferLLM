@@ -1,0 +1,303 @@
+// Statically selected two-level reductions for the fused low-rank GEMV.
+//
+// Both axes remain configured at the same time:
+//   queues 2,3,4 -> stage-1 Y group reduction, root reduction, broadcast
+//   queues 5,6,7 -> stage-2 X group reduction, root reduction, broadcast
+//
+// Each reduction has two levels. PEs first reduce concurrently inside groups;
+// then the group roots reduce among themselves. Adjacent senders alternate
+// between two colors, so a PE can receive one color at RAMP and originate the
+// other without violating WSE-3's one-input-direction-per-color rule.
+//
+// Local roots are the trailing PE of each group and the global root is the last PE on its axis.
+// This makes both levels one-directional and limits each axis to three input
+// queues per PE. The critical dependency depth is approximately
+// group_size + axis_size/group_size on each axis.
+
+param Px: i16;
+param Py: i16;
+param Rt: i16;
+param Nt: i16;
+param pe_num_group_x: i16;
+param pe_num_group_y: i16;
+param root_1st_phase_x: i16;
+param root_1st_phase_y: i16;
+param root_2nd_phase_x: i16;
+param root_2nd_phase_y: i16;
+param px_id: i16;
+param py_id: i16;
+
+param on_z_chunk_ready_task_id: local_task_id;
+
+param y_group_color_0: color;
+param y_group_color_1: color;
+param y_root_color_0: color;
+param y_root_color_1: color;
+param y_bcast_color: color;
+param x_group_color_0: color;
+param x_group_color_1: color;
+param x_root_color_0: color;
+param x_root_color_1: color;
+param x_bcast_color: color;
+
+const y_group_iq = @get_input_queue(2);
+const y_group_oq = @get_output_queue(2);
+const y_root_iq = @get_input_queue(3);
+const y_root_oq = @get_output_queue(3);
+const y_bcast_iq = @get_input_queue(4);
+const y_bcast_oq = @get_output_queue(4);
+const x_group_iq = @get_input_queue(5);
+const x_group_oq = @get_output_queue(5);
+const x_root_iq = @get_input_queue(6);
+const x_root_oq = @get_output_queue(6);
+const x_bcast_iq = @get_input_queue(7);
+const x_bcast_oq = @get_output_queue(7);
+
+const phase_two_reduction_y_task_id = @get_local_task_id(9);
+const board_cast_y_task_id = @get_local_task_id(10);
+const broadcast_done_id = @get_local_task_id(11);
+
+const y_ut = @get_ut_id(1);
+
+const tile_config = @import_module("<tile_config>");
+const color_config = tile_config.color_config;
+const dummy = @zeros([1]f16);
+const vector_dsr = @get_dsr(dsr_src1, 2);
+
+const quotient_x = px_id / pe_num_group_x;
+const remainder_x = px_id - quotient_x * pe_num_group_x;
+const quotient_y = py_id / pe_num_group_y;
+const remainder_y = py_id - quotient_y * pe_num_group_y;
+
+// Every PE originates on the color selected by its own parity and receives
+// the opposite color, which was originated by its preceding neighbour.
+const y_group_send_color = if (remainder_y % 2 == 0) y_group_color_0 else y_group_color_1;
+const y_group_recv_color = if (remainder_y % 2 == 0) y_group_color_1 else y_group_color_0;
+const x_group_send_color = if (remainder_x % 2 == 0) x_group_color_0 else x_group_color_1;
+const x_group_recv_color = if (remainder_x % 2 == 0) x_group_color_1 else x_group_color_0;
+
+// The second level alternates by group index rather than physical PE parity.
+const y_root_send_color = if (quotient_y % 2 == 0) y_root_color_0 else y_root_color_1;
+const y_root_recv_color = if (quotient_y % 2 == 0) y_root_color_1 else y_root_color_0;
+const x_root_send_color = if (quotient_x % 2 == 0) x_root_color_0 else x_root_color_1;
+const x_root_recv_color = if (quotient_x % 2 == 0) x_root_color_1 else x_root_color_0;
+
+var y_group_send = @get_dsd(fabout_dsd, .{ .extent = Rt, .output_queue = y_group_oq, .simd_mode = .{ .simd_max = true } });
+var y_group_recv = @get_dsd(fabin_dsd, .{ .extent = Rt, .input_queue = y_group_iq, .simd_mode = .{ .simd_max = true } });
+var y_root_send = @get_dsd(fabout_dsd, .{ .extent = Rt, .output_queue = y_root_oq, .simd_mode = .{ .simd_max = true } });
+var y_root_recv = @get_dsd(fabin_dsd, .{ .extent = Rt, .input_queue = y_root_iq, .simd_mode = .{ .simd_max = true } });
+var y_bcast_send = @get_dsd(fabout_dsd, .{ .extent = Rt, .output_queue = y_bcast_oq, .simd_mode = .{ .simd_max = true } });
+var y_bcast_recv = @get_dsd(fabin_dsd, .{ .extent = Rt, .input_queue = y_bcast_iq, .simd_mode = .{ .simd_max = true } });
+var vector_rt = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = Rt });
+
+const x_group_send = @get_dsd(fabout_dsd, .{ .extent = Nt, .output_queue = x_group_oq, .simd_mode = .{ .simd_max = true } });
+const x_group_recv = @get_dsd(fabin_dsd, .{ .extent = Nt, .input_queue = x_group_iq, .simd_mode = .{ .simd_max = true } });
+const x_root_send = @get_dsd(fabout_dsd, .{ .extent = Nt, .output_queue = x_root_oq, .simd_mode = .{ .simd_max = true } });
+const x_root_recv = @get_dsd(fabin_dsd, .{ .extent = Nt, .input_queue = x_root_iq, .simd_mode = .{ .simd_max = true } });
+const x_bcast_send = @get_dsd(fabout_dsd, .{ .extent = Nt, .output_queue = x_bcast_oq, .simd_mode = .{ .simd_max = true } });
+const x_bcast_recv = @get_dsd(fabin_dsd, .{ .extent = Nt, .input_queue = x_bcast_iq, .simd_mode = .{ .simd_max = true } });
+var vector_nt = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = Nt });
+
+// Configure an alternating-color chain inside every local group. A color is
+// either injected from RAMP or received from HEAD, never both on one PE.
+fn config_group(comptime c0: color, comptime c1: color,
+                comptime HEAD: direction, comptime TAIL: direction,
+                remainder: i16) void {
+    if (remainder % 2 == 0) {
+        color_config.reset_routes(c0, .{ .rx = RAMP, .tx = TAIL });
+        color_config.reset_routes(c1, .{ .rx = HEAD, .tx = RAMP });
+    } else {
+        color_config.reset_routes(c1, .{ .rx = RAMP, .tx = TAIL });
+        color_config.reset_routes(c0, .{ .rx = HEAD, .tx = RAMP });
+    }
+}
+
+// Group roots form another alternating chain. Non-root PEs are transparent
+// wires, so a root-to-root message crosses a whole group without landing.
+fn config_roots(comptime c0: color, comptime c1: color,
+                comptime HEAD: direction, comptime TAIL: direction,
+                quotient: i16, remainder: i16,
+                comptime local_root: i16) void {
+    if (remainder == local_root) {
+        if (quotient % 2 == 0) {
+            color_config.reset_routes(c0, .{ .rx = RAMP, .tx = TAIL });
+            color_config.reset_routes(c1, .{ .rx = HEAD, .tx = RAMP });
+        } else {
+            color_config.reset_routes(c1, .{ .rx = RAMP, .tx = TAIL });
+            color_config.reset_routes(c0, .{ .rx = HEAD, .tx = RAMP });
+        }
+    } else {
+        color_config.reset_routes(c0, .{ .rx = HEAD, .tx = TAIL });
+        color_config.reset_routes(c1, .{ .rx = HEAD, .tx = TAIL });
+    }
+}
+
+// The global root is the last PE on its axis, so broadcast travels only toward HEAD. Intermediate
+// PEs both land the vector at RAMP and forward it to the preceding PE.
+fn config_bcast(comptime c: color, comptime HEAD: direction,
+                comptime TAIL: direction, pe_id: i16,
+                comptime global_root: i16) void {
+    if (pe_id == global_root) {
+        color_config.reset_routes(c, .{ .rx = RAMP, .tx = HEAD });
+    } else if (pe_id == 0) {
+        color_config.reset_routes(c, .{ .rx = TAIL, .tx = RAMP });
+    } else {
+        color_config.reset_routes(c, .{ .rx = TAIL, .tx = [2]direction{HEAD, RAMP} });
+    }
+}
+
+fn init(px: i16, py: i16, qx: i16, rx: i16, qy: i16, ry: i16) void {
+    // The arguments are retained to keep meshgemv.csl's initialization API
+    // simple. Routes use the equivalent comptime px_id/py_id specialization.
+    config_group(y_group_color_0, y_group_color_1, NORTH, SOUTH, remainder_y);
+    config_roots(y_root_color_0, y_root_color_1, NORTH, SOUTH, quotient_y, remainder_y, root_1st_phase_y);
+    config_bcast(y_bcast_color, NORTH, SOUTH, py_id, root_2nd_phase_y);
+    config_group(x_group_color_0, x_group_color_1, WEST, EAST, remainder_x);
+    config_roots(x_root_color_0, x_root_color_1, WEST, EAST, quotient_x, remainder_x, root_1st_phase_x);
+    config_bcast(x_bcast_color, WEST, EAST, px_id, root_2nd_phase_x);
+}
+
+fn allreduce_rt_y_chunk(ptr: [*]f16, length: i16) void {
+    vector_rt = @set_dsd_base_addr(vector_rt, ptr);
+    vector_rt = @set_dsd_length(vector_rt, @as(u16, length));
+
+    y_group_send = @set_dsd_length(y_group_send, @as(u16, length));
+    y_group_recv = @set_dsd_length(y_group_recv, @as(u16, length));
+    y_root_send = @set_dsd_length(y_root_send, @as(u16, length));
+    y_root_recv = @set_dsd_length(y_root_recv, @as(u16, length));
+    y_bcast_send = @set_dsd_length(y_bcast_send, @as(u16, length));
+    y_bcast_recv = @set_dsd_length(y_bcast_recv, @as(u16, length));
+
+    allreduce_y();
+}
+
+fn phase_one_reduction_y() void {
+    // Pass memory DSDs directly through the callback chain. A manually loaded
+    // DSR must not be assumed to retain its descriptor across task boundaries.
+    if (pe_num_group_y > 1) {
+        if (remainder_y == 0) {
+            @fmovh(y_group_send, vector_rt, .{.async = true, .ut_id = y_ut, .activate = phase_two_reduction_y});
+        } else if (remainder_y == root_1st_phase_y) {
+            @faddh(vector_rt, y_group_recv, vector_rt, .{.async = true, .ut_id = y_ut, .activate = phase_two_reduction_y});
+        } else {
+            @faddh(y_group_send, y_group_recv, vector_rt, .{.async = true, .ut_id = y_ut, .activate = phase_two_reduction_y});
+        }
+    }
+    else{
+         @activate(phase_two_reduction_y_task_id);
+    }
+}
+
+task phase_two_reduction_y() void {
+    if (Py / pe_num_group_y == 1 or remainder_y != root_1st_phase_y) {
+        // Only one group, or this PE is not a group root.
+        @activate(board_cast_y_task_id);
+    } 
+    else if (quotient_y == 0) {
+        @fmovh(y_root_send, vector_rt, .{
+            .async = true,
+            .ut_id = y_ut,
+            .activate = board_cast_y
+        });
+    } 
+    else if (py_id == root_2nd_phase_y) {
+        @faddh(vector_rt, y_root_recv, vector_rt, .{
+            .async = true,
+            .ut_id = y_ut,
+            .activate = board_cast_y
+        });
+    } 
+    else {
+        @faddh(y_root_send, y_root_recv, vector_rt, .{
+            .async = true,
+            .ut_id = y_ut,
+            .activate = board_cast_y
+        });
+    }
+}
+
+task board_cast_y() void{
+    if (py_id == root_2nd_phase_y) {
+        @mov16(y_bcast_send, vector_rt, .{
+            .async = true,
+            .ut_id = y_ut,
+            .activate = broadcast_done
+        });
+    } else {
+        @mov16(vector_rt, y_bcast_recv, .{
+            .async = true,
+            .ut_id = y_ut,
+            .activate = broadcast_done
+        });
+    }
+}
+
+task broadcast_done() void {
+    // Signal readiness only after this PE's broadcast operation completes.
+    @activate(on_z_chunk_ready_task_id);
+}
+
+fn allreduce_y() void {
+    phase_one_reduction_y();
+}
+
+fn allreduce_rt_y(ptr: [*]f16) void {
+    allreduce_rt_y_chunk(ptr, Rt);
+}
+
+fn allreduce_nt_x(ptr: [*]f16) void {
+    vector_nt = @set_dsd_base_addr(vector_nt, ptr);
+    @load_to_dsr(vector_dsr, vector_nt);
+
+    if (pe_num_group_x > 1) {
+        if (remainder_x == 0) {
+            @fmovh(x_group_send, vector_dsr);
+        } else if (remainder_x == root_1st_phase_x) {
+            @faddh(vector_nt, x_group_recv, vector_dsr);
+        } else {
+            @faddh(x_group_send, x_group_recv, vector_dsr);
+        }
+    }
+
+    if (Px / pe_num_group_x > 1) {
+        if (remainder_x == root_1st_phase_x) {
+            if (quotient_x == 0) {
+                @fmovh(x_root_send, vector_dsr);
+            } else if (px_id == root_2nd_phase_x) {
+                @faddh(vector_nt, x_root_recv, vector_dsr);
+            } else {
+                @faddh(x_root_send, x_root_recv, vector_dsr);
+            }
+        }
+    }
+
+    if (px_id == root_2nd_phase_x) {
+        @mov16(x_bcast_send, vector_dsr);
+    } else {
+        @mov16(vector_nt, x_bcast_recv);
+    }
+}
+
+comptime {
+    @assert(root_1st_phase_x == pe_num_group_x - 1);
+    @assert(root_2nd_phase_x == Px - 1);
+    @assert(root_1st_phase_y == pe_num_group_y - 1);
+    @assert(root_2nd_phase_y == Py - 1);
+
+    @initialize_queue(y_group_iq, .{ .color = y_group_recv_color });
+    @initialize_queue(y_group_oq, .{ .color = y_group_send_color });
+    @initialize_queue(y_root_iq, .{ .color = y_root_recv_color });
+    @initialize_queue(y_root_oq, .{ .color = y_root_send_color });
+    @initialize_queue(y_bcast_iq, .{ .color = y_bcast_color });
+    @initialize_queue(y_bcast_oq, .{ .color = y_bcast_color });
+    @initialize_queue(x_group_iq, .{ .color = x_group_recv_color });
+    @initialize_queue(x_group_oq, .{ .color = x_group_send_color });
+    @initialize_queue(x_root_iq, .{ .color = x_root_recv_color });
+    @initialize_queue(x_root_oq, .{ .color = x_root_send_color });
+    @initialize_queue(x_bcast_iq, .{ .color = x_bcast_color });
+    @initialize_queue(x_bcast_oq, .{ .color = x_bcast_color });
+
+    @bind_local_task(phase_two_reduction_y, phase_two_reduction_y_task_id);
+    @bind_local_task(board_cast_y, board_cast_y_task_id);
+    @bind_local_task(broadcast_done, broadcast_done_id);
+}

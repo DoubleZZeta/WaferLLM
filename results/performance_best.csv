@@ -1,0 +1,5 @@
+status,target_retained_work_ratio,repetitions,profile_phases,projection_gemv_count,dense_block_cycles,fused_block_cycles,fused_speedup_vs_dense,cycle_reduction_percent,qkvo_mean_cycles,gate_up_mean_cycles,down_mean_cycles,qkvo_rank,gate_up_rank,down_rank,qkvo_grid,gate_up_grid,down_grid,qkvo_groups,gate_up_groups,down_groups
+ok,0.2,1,False,7,17518,11053,1.5849090744594228,36.90489781938577,1291,1914,2061,384,576,576,64x64,64x64,64x64,8x8,8x8,8x8
+ok,0.4,1,False,7,17518,13991,1.2520906296905154,20.13357689233931,1644,2479,2457,832,1216,1216,64x64,32x128,32x128,8x8,4x8,4x8
+ok,0.6,1,False,7,17518,16719,1.0477899395896884,4.5610229478251,1931,3006,2983,1216,1792,1792,64x64,64x64,64x64,8x8,8x8,8x8
+ok,0.8,1,False,7,17518,18958,0.9240426205295917,-8.220116451649728,2005,3659,3620,1664,2368,2368,64x64,64x64,32x128,8x8,8x8,4x8

@@ -1,0 +1,7 @@
+stage,axis_pes,observed_min_elements,observed_max_elements,distinct_lengths,intercept_cycles,cycles_per_element_pair,max_abs_residual
+stage1_y,32,3,14,7,231.875,3,0.0
+stage1_y,64,6,38,8,387.875,3,0.0
+stage1_y,128,12,76,8,699.875,3,0.0
+stage2_x,32,32,86,2,230.125,3,0.0
+stage2_x,64,64,172,2,386.125,3,0.0
+stage2_x,128,128,344,2,698.125,3,0.0

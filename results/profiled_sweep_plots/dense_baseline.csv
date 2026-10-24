@@ -1,0 +1,4 @@
+projection,execution,grid,Px,Py,group_num_x,group_num_y,M,N,rank,target_retained_work_ratio,actual_retained_work_ratio,multiplicity,mean_cycles,max_cycles,compute1_cycles,compute2_cycles,reduce1_cycles,reduce2_cycles,communication_cycles,compute_cycles,control_cycles,profile_iteration_cycles,communication_share_percent,source
+qkvo,dense,64×64,64,64,8,8,4096,4096,,1.0,1.0,4,1704.0,1830.0,1156.0,0.0,479.0,0.0,479.0,1156.0,37.0,1672.0,28.648325358851675,runs/profile_full_dense64_20261003/logs/dense_qkvo_m4096_n4096.phases.json
+gate_up,dense,64×64,64,64,8,8,4096,11008,,1.0,1.0,2,3808.0,3934.0,2936.0,0.0,803.0,0.0,803.0,2936.0,37.0,3776.0,21.265889830508474,runs/profile_full_dense64_20261003/logs/dense_gate_up_m4096_n11008.phases.json
+down,dense,64×64,64,64,8,8,11008,4096,,1.0,1.0,1,3541.0,3667.0,2993.0,0.0,479.0,0.0,479.0,2993.0,37.0,3509.0,13.650612710173839,runs/profile_full_dense64_20261003/logs/dense_down_m11008_n4096.phases.json

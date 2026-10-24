@@ -1,0 +1,243 @@
+{
+  "sdk": "2.10.0, WSE-3 simulator",
+  "date": "2026-10-18",
+  "note": "Correctness/control cases, not a performance prediction for 4096-PE production shapes. Normal runs: one warmup and three repetitions. Profile runs: one warmup and one measured iteration.",
+  "results": [
+    {
+      "mean_cycles": 342.7083333333333,
+      "max_cycles": 346.3333333333333,
+      "relative_l2_error": 0.000744664134531945,
+      "case": "baseline",
+      "PX": 4,
+      "PY": 8,
+      "R": 20,
+      "chunks": 1,
+      "schedule": "serial",
+      "profile": false,
+      "M": 64,
+      "N": 128
+    },
+    {
+      "mean_cycles": 455.9583333333333,
+      "max_cycles": 459.0,
+      "relative_l2_error": 0.000744664134531945,
+      "case": "one",
+      "PX": 4,
+      "PY": 8,
+      "R": 20,
+      "chunks": 1,
+      "schedule": "pipeline",
+      "profile": false,
+      "M": 64,
+      "N": 128
+    },
+    {
+      "mean_cycles": 676.0,
+      "max_cycles": 679.3333333333334,
+      "relative_l2_error": 0.000744664134531945,
+      "case": "pipeline_odd",
+      "PX": 4,
+      "PY": 8,
+      "R": 20,
+      "chunks": 2,
+      "schedule": "pipeline",
+      "profile": false,
+      "M": 64,
+      "N": 128
+    },
+    {
+      "mean_cycles": 685.0,
+      "max_cycles": 688.3333333333334,
+      "relative_l2_error": 0.000744664134531945,
+      "case": "serial_odd",
+      "PX": 4,
+      "PY": 8,
+      "R": 20,
+      "chunks": 2,
+      "schedule": "serial",
+      "profile": false,
+      "M": 64,
+      "N": 128
+    },
+    {
+      "mean_cycles": 946.0,
+      "max_cycles": 949.3333333333334,
+      "relative_l2_error": 0.0008292884464331392,
+      "case": "reverse_three",
+      "PX": 8,
+      "PY": 4,
+      "R": 40,
+      "chunks": 3,
+      "schedule": "pipeline",
+      "profile": false,
+      "M": 64,
+      "N": 128
+    },
+    {
+      "mean_cycles": 962.0,
+      "max_cycles": 964.0,
+      "relative_l2_error": 0.0007772605999510323,
+      "case": "singleton_groups",
+      "PX": 4,
+      "PY": 4,
+      "R": 16,
+      "chunks": 4,
+      "schedule": "pipeline",
+      "profile": false,
+      "M": 64,
+      "N": 128
+    },
+    {
+      "mean_cycles": 646.0,
+      "max_cycles": 648.0,
+      "relative_l2_error": 0.0007459554559263481,
+      "case": "single_group",
+      "PX": 4,
+      "PY": 4,
+      "R": 24,
+      "chunks": 2,
+      "schedule": "pipeline",
+      "profile": false,
+      "M": 64,
+      "N": 128
+    },
+    {
+      "mean_cycles": 874.0,
+      "max_cycles": 884.0,
+      "relative_l2_error": 0.000744664134531945,
+      "phases": {
+        "stage1_local_compute": {
+          "mean_cycles": 87.0,
+          "max_pe_cycles": 87.0
+        },
+        "pipeline_elapsed": {
+          "mean_cycles": 663.0,
+          "max_pe_cycles": 663.0
+        },
+        "stage2_x_allreduce": {
+          "mean_cycles": 86.0,
+          "max_pe_cycles": 86.0
+        },
+        "profile_iteration": {
+          "mean_cycles": 836.0,
+          "max_pe_cycles": 836.0
+        },
+        "chunk0_stage2_compute": {
+          "mean_cycles": 87.25,
+          "max_pe_cycles": 88.0
+        },
+        "chunk0_ready_since_pipeline_start": {
+          "mean_cycles": 190.875,
+          "max_pe_cycles": 191.0
+        },
+        "chunk1_stage2_compute": {
+          "mean_cycles": 82.0,
+          "max_pe_cycles": 82.0
+        },
+        "chunk1_ready_since_pipeline_start": {
+          "mean_cycles": 504.0,
+          "max_pe_cycles": 504.0
+        }
+      },
+      "case": "profile_pipeline",
+      "PX": 4,
+      "PY": 8,
+      "R": 20,
+      "chunks": 2,
+      "schedule": "pipeline",
+      "profile": true,
+      "M": 64,
+      "N": 128
+    },
+    {
+      "mean_cycles": 883.0,
+      "max_cycles": 893.0,
+      "relative_l2_error": 0.000744664134531945,
+      "phases": {
+        "stage1_local_compute": {
+          "mean_cycles": 87.0,
+          "max_pe_cycles": 87.0
+        },
+        "pipeline_elapsed": {
+          "mean_cycles": 672.0,
+          "max_pe_cycles": 672.0
+        },
+        "stage2_x_allreduce": {
+          "mean_cycles": 86.0,
+          "max_pe_cycles": 86.0
+        },
+        "profile_iteration": {
+          "mean_cycles": 845.0,
+          "max_pe_cycles": 845.0
+        },
+        "chunk0_stage2_compute": {
+          "mean_cycles": 87.0,
+          "max_pe_cycles": 87.0
+        },
+        "chunk0_ready_since_pipeline_start": {
+          "mean_cycles": 190.875,
+          "max_pe_cycles": 191.0
+        },
+        "chunk1_stage2_compute": {
+          "mean_cycles": 82.0,
+          "max_pe_cycles": 82.0
+        },
+        "chunk1_ready_since_pipeline_start": {
+          "mean_cycles": 513.0,
+          "max_pe_cycles": 513.0
+        }
+      },
+      "case": "profile_serial",
+      "PX": 4,
+      "PY": 8,
+      "R": 20,
+      "chunks": 2,
+      "schedule": "serial",
+      "profile": true,
+      "M": 64,
+      "N": 128
+    },
+    {
+      "mean_cycles": 1862.6666666666667,
+      "max_cycles": 1866.0,
+      "relative_l2_error": 0.0012874887340397813,
+      "case": "larger_baseline",
+      "PX": 4,
+      "PY": 8,
+      "R": 128,
+      "chunks": 1,
+      "schedule": "serial",
+      "profile": false,
+      "M": 256,
+      "N": 1024
+    },
+    {
+      "mean_cycles": 2194.0,
+      "max_cycles": 2197.3333333333335,
+      "relative_l2_error": 0.0012874887340397813,
+      "case": "larger_pipeline",
+      "PX": 4,
+      "PY": 8,
+      "R": 128,
+      "chunks": 2,
+      "schedule": "pipeline",
+      "profile": false,
+      "M": 256,
+      "N": 1024
+    },
+    {
+      "mean_cycles": 2206.0,
+      "max_cycles": 2209.3333333333335,
+      "relative_l2_error": 0.0012874887340397813,
+      "case": "larger_serial",
+      "PX": 4,
+      "PY": 8,
+      "R": 128,
+      "chunks": 2,
+      "schedule": "serial",
+      "profile": false,
+      "M": 256,
+      "N": 1024
+    }
+  ]
+}

@@ -46,6 +46,10 @@ def parse_args(argv, mode, execution="fused"):
     p.add_argument('--build-root')
     p.add_argument('--resume', action='store_true')
     p.add_argument('--dry-run', action='store_true')
+    if execution == 'chunked':
+        p.add_argument('--chunks', type=int, default=None, help='rank chunks per PE (default: 2)')
+        p.add_argument('--schedule', choices=['pipeline', 'serial'], default=None,
+                       help='overlap next Y collective with current B chunk, or serialize (default: pipeline)')
     if mode == 'sweep':
         p.add_argument('--M', type=integers, required=True)
         p.add_argument('--N', type=integers, required=True)
@@ -72,6 +76,10 @@ def parse_args(argv, mode, execution="fused"):
         p.error('provide --ranks or --retained-work-ratios')
     if args.repetitions is not None and not 1 <= args.repetitions <= 32767:
         p.error('repetitions must be between 1 and 32767')
+    if execution == 'chunked' and args.chunks is not None and args.chunks < 1:
+        p.error('--chunks must be positive')
+    if execution == "pipelining" and args.profile_phases:
+        p.error("pipelining does not yet support --profile-phases")
     args.execution = execution
     return args
 
@@ -113,6 +121,8 @@ def plan(args, mode):
                 reason = 'M and N must be divisible by PY'
             elif not dense and (rank % px or not 0 < rank <= min(m, n)):
                 reason = 'require R divisible by PX and 0 < R <= min(M,N)'
+            if reason is None and args.execution == "pipelining" and rank // px < 2:
+                reason = "pipelining requires R/PX >= 2"
             rows.append((row, reason))
     return rows
 
@@ -128,14 +138,28 @@ def shape_args(row):
 def main(argv, mode, execution="fused"):
     args = parse_args(argv, mode, execution)
     dense = execution == "dense"
-    kernel = "MeshGEMVRectangular" if dense else DEFAULT_CONFIG['kernel']
+    chunked = execution == 'chunked'
+    kernel = "MeshGEMVLowerRankChunked" if chunked else ("MeshGEMVRectangular" if dense else DEFAULT_CONFIG['kernel'])
+    if execution == "pipelining":
+        kernel = "MeshGEMVLowerRankPipelining"
     defaults = {**DEFAULT_CONFIG, "kernel": kernel}
     fields = tuple(f.replace('fused_', 'dense_') for f in FIELDS) if dense else FIELDS
+    if chunked:
+        defaults.update(chunks=2, schedule='pipeline')
+        fields = fields + ('chunks', 'schedule')
     columns = {k: v.replace('fused_', 'dense_') for k, v in COLUMNS.items()} if dense else COLUMNS
     run_dir = (bench.RUNS_DIR if mode == 'bench' else bench.BENCH_DIR/'sweeps') / args.run_name
     config = bench.resolve_config(args, run_dir, write=not args.dry_run, defaults=defaults)
+    if execution == "pipelining":
+        if config["profile_phases"]:
+            raise SystemExit("pipelining does not yet support --profile-phases")
+        if not 1 <= config["repetitions"] <= 32766:
+            raise SystemExit("pipelining repetitions must be 1..32766 (plus one warmup)")
     build_root = bench.resolve_build_root(args, run_dir, write=not args.dry_run)
     cases = plan(args, mode)
+    if chunked:
+        cases = [(row, reason or ('chunks must be <= R/PX' if config['chunks'] > int(row['rank'])//row['Px'] else None))
+                 for row,reason in cases]
     print(f'Rectangular run: {run_dir}; profiling={config["profile_phases"]}; repetitions={config["repetitions"]}')
     for row, reason in cases:
         print(f'{"SKIP" if reason else "RUN"}: {row["projection_group"]} '
@@ -144,7 +168,7 @@ def main(argv, mode, execution="fused"):
               f'actual_rho={row["retained_work_ratio"]:.6f}' + (f' ({reason})' if reason else ''))
     if args.dry_run:
         return 0
-    path = run_dir/f'{execution}-rectangular.csv'
+    path = run_dir/('fused-pipelining.csv' if execution == 'pipelining' else ('fused-chunked.csv' if chunked else f'{execution}-rectangular.csv'))
     bench.prepare_results(path, fields, args.resume)
     done = bench.completed_keys(path, key) if args.resume else set()
     failures = 0
@@ -157,11 +181,18 @@ def main(argv, mode, execution="fused"):
             failures += 1
             continue
         row.update(repetitions=config['repetitions'], profile_phases=config['profile_phases'])
+        if chunked:
+            row.update(chunks=config['chunks'], schedule=config['schedule'])
         slug = (f'{row["projection_group"]}_px{row["Px"]}_py{row["Py"]}'
                 f'_gx{row["group_num_x"]}_gy{row["group_num_y"]}'
                 f'_m{row["M"]}_r{row["rank"]}_n{row["N"]}')
+        shape = shape_args(row)
+        if chunked:
+            shape += ['--chunks', str(config['chunks']), '--schedule', config['schedule']]
         commands = bench.kernel_commands(kernel, f'launch_{execution}_rectangular.py',
-                    shape_args(row), config, run_dir/'build'/slug, args.suppress_simfab_trace, build_root)
+                    shape, config, run_dir/'build'/slug, args.suppress_simfab_trace, build_root)
+        if chunked and config['profile_phases']:
+            commands[0].append('--profile-phases')
         row = bench.run_case(row, commands, run_dir/'logs'/f'{slug}.log', columns)
         bench.upsert_result(path, fields, key, row)
         failures += row['status'] != 'ok'
