@@ -39,7 +39,7 @@ RUNS_DIR = BENCH_DIR / "runs"
 
 # Dense and fused rows are comparable only when these settings match, so they
 # are recorded in runs/<run>/config.json by the first subcommand of a run.
-DEFAULT_CONFIG = {"P": 64, "group_num": 8, "repetitions": 3, "hcf_fix": False, "profile_phases": False}
+DEFAULT_CONFIG = {"P": 64, "group_num": 8, "repetitions": 3, "hcf_fix": False, "dense_timing": False, "profile_phases": False}
 DEFAULT_RATIOS = [0.125, 0.25, 0.5, 0.75]
 
 
@@ -98,6 +98,8 @@ def comma_floats(value: str) -> list[float]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run_options = argparse.ArgumentParser(add_help=False)
+    run_options.add_argument("--dense-timing", action=argparse.BooleanOptionalAction, default=None,
+        help="use MeshGEMVTiming detailed dense profiling (requires a separate run name)")
     run_options.add_argument("--profile-phases", action=argparse.BooleanOptionalAction, default=None,
         help="profile one warmed iteration; use a separate run name (saved in config)")
     run_options.add_argument(
@@ -186,6 +188,12 @@ def resolve_config(
         name: base[name] if getattr(args, name, None) is None else getattr(args, name, None)
         for name in defaults
     }
+    if config.get("dense_timing"):
+        if args.command != "dense":
+            raise SystemExit("--dense-timing is supported only for dense runs")
+        if getattr(args, "profile_phases", None) is False:
+            raise SystemExit("--dense-timing requires profiling")
+        config["profile_phases"] = True
     if config.get("profile_phases"):
         if getattr(args, "repetitions", None) not in (None, 1):
             raise SystemExit("--profile-phases requires --repetitions 1 (or omit it)")
@@ -540,6 +548,14 @@ def run_case(
             phase_rows = [{"phase": phase, **metrics} for phase, metrics in result["phases"].items()]
             write_rows(log_path.with_suffix(".phases.csv"),
                        ("phase", "mean_cycles", "max_pe_cycles"), phase_rows)
+        if any(part.endswith("launch_dense_timing.py") for part in commands[-1]):
+            launch = commands[-1]
+            artifact = Path(launch[launch.index("--out-dir") + 1])
+            if not artifact.is_absolute():
+                artifact = REPO_DIR / artifact
+            for suffix in ("operations", "operation_rows"):
+                source = artifact / f"timing_{row['P']}_{row['M']}_{row['N']}_{row['group_num']}.{suffix}.csv"
+                log_path.with_suffix(f".{suffix}.csv").write_bytes(source.read_bytes())
         if row.get("chunks") and result.get("phases"):
             launch = commands[-1]
             artifact = Path(launch[launch.index("--out-dir") + 1])
@@ -569,6 +585,8 @@ def case_row(config: dict, case: ProjectionCase) -> dict[str, object]:
 
 def dense_implementation(config: dict) -> tuple[str, str]:
     """Kernel folder and launcher for the dense baseline."""
+    if config.get("dense_timing"):
+        return "MeshGEMVTiming", "launch_dense_timing.py"
     if config["hcf_fix"]:
         return "MeshGEMVPatched", "launch_dense_patched.py"
     return "MeshGEMV", "launch_dense.py"

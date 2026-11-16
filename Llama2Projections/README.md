@@ -368,3 +368,20 @@ python3 sweep.py fused-pipelining --run-name pipeline_small \
 
 Existing `--build-root`, `--resume`, and `--dry-run` options are supported.
 No full performance sweep is started automatically.
+
+### Dense reduction-operation diagnostics
+
+Both runners accept `dense --dense-timing`. This selects `MeshGEMVTiming`,
+automatically enables phase profiling, and locks the selection in config.json.
+Use a new run name so these instrumented results do not replace the baseline.
+
+```bash
+bash run_sweep.sh dense dense_timing_g --dense-timing --P 64 --group-num 4,16 --M 4096 --N 4096
+bash run.sh dense dense_timing_shapes --dense-timing --P 64 --group-num 8
+```
+
+In addition to `.phases.csv/.json`, each successful case's logs directory receives
+`.operations.csv` (per-PE intervals) and `.operation_rows.csv` (per-row summaries).
+These are copied from the build directory, including when `--build-root` is used.
+Operation durations include waits, streamed arithmetic/sends and marker overhead;
+they are not isolated network latency measurements.

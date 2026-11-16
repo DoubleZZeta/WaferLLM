@@ -26,7 +26,7 @@ SWEEPS_DIR = bench.BENCH_DIR / "sweeps"
 
 # Only run-wide settings are locked in config.json. P, group_num, M, N and R
 # are sweep axes recorded on every row, so later commands may add new values.
-DEFAULT_CONFIG = {"repetitions": 3, "hcf_fix": False, "profile_phases": False}
+DEFAULT_CONFIG = {"repetitions": 3, "hcf_fix": False, "dense_timing": False, "profile_phases": False}
 
 SHAPE_FIELDS = ("status", "P", "group_num", "repetitions", "M", "N")
 RANK_FIELDS = ("rank", "target_retained_work_ratio", "retained_work_ratio")
@@ -71,6 +71,8 @@ def comma_ints(value: str) -> list[int]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     options = argparse.ArgumentParser(add_help=False)
+    options.add_argument("--dense-timing", action=argparse.BooleanOptionalAction, default=None,
+        help="use MeshGEMVTiming detailed dense profiling (requires a separate run name)")
     options.add_argument("--profile-phases", action=argparse.BooleanOptionalAction, default=None,
         help="profile one warmed iteration; use a separate run name (saved in config)")
     options.add_argument(
